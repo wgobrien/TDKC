@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use rustc_hash::FxHashMap;
@@ -40,6 +41,7 @@ struct MaskedChunk {
     records: Vec<MaskedRecord>,
     taxid: u32,
     assembly_accession: String,
+    worker_time: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -52,7 +54,7 @@ pub struct ManifestRow {
 }
 
 pub struct SharedWriters {
-    pub prelim_map_tx: mpsc::UnboundedSender<(String, u32)>,
+    pub prelim_map_tx: mpsc::UnboundedSender<Vec<(String, u32)>>,
     pub manifest_tx: mpsc::UnboundedSender<ManifestRow>,
 }
 
@@ -67,7 +69,7 @@ impl SharedWriters {
         let manifest_path = genome_dir.join(format!("_manifest.{}.tsv", domain_name));
 
         let (prelim_tx, mut prelim_rx) =
-            mpsc::unbounded_channel::<(String, u32)>();
+            mpsc::unbounded_channel::<Vec<(String, u32)>>();
         let (manifest_tx, mut manifest_rx) = mpsc::unbounded_channel::<ManifestRow>();
 
         let prelim_handle: JoinHandle<Result<()>> = tokio::spawn(async move {
@@ -75,9 +77,15 @@ impl SharedWriters {
                 .await
                 .with_context(|| format!("create {}", prelim_path.display()))?;
             let mut w = TokioBufWriter::with_capacity(4 * 1024 * 1024, f);
-            while let Some((acc, taxid)) = prelim_rx.recv().await {
-                let line = format!("{}\t{}\n", acc, taxid);
-                w.write_all(line.as_bytes()).await?;
+            while let Some(rows) = prelim_rx.recv().await {
+                let mut batch = Vec::with_capacity(rows.len() * 24);
+                for (accession, taxid) in rows {
+                    batch.extend_from_slice(accession.as_bytes());
+                    batch.push(b'\t');
+                    batch.extend_from_slice(taxid.to_string().as_bytes());
+                    batch.push(b'\n');
+                }
+                w.write_all(&batch).await?;
             }
             w.flush().await?;
             Ok(())
@@ -115,9 +123,9 @@ impl SharedWriters {
         ))
     }
 
-    fn send_prelim(&self, record_id: String, taxid: u32) -> Result<()> {
+    fn send_prelim_batch(&self, rows: Vec<(String, u32)>) -> Result<()> {
         self.prelim_map_tx
-            .send((record_id, taxid))
+            .send(rows)
             .map_err(|_| anyhow!("prelim_map writer task died"))
     }
 
@@ -139,10 +147,47 @@ pub struct PipelineConfig {
     pub relevant_taxids: Arc<HashSet<u32>>,
     pub shared: Arc<SharedWriters>,
     pub custom_map: Option<Arc<FxHashMap<String, u32>>>,
+    pub background_output: BackgroundOutput,
     pub no_mask: bool,
     /// When a custom_map is present, drop records whose id has no taxid mapping
     /// instead of emitting them with the fallback taxid
     pub drop_unmapped: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackgroundOutput {
+    /// Preserve the downloaded-domain layout: the full FASTA is used as a challenger.
+    Challenger,
+    /// Write only non-target records to an underscore-prefixed domain FASTA.
+    Domain,
+    /// Do not retain non-target records.
+    Discard,
+}
+
+fn background_path(
+    genome_dir: &Path,
+    domain_name: &str,
+    output: BackgroundOutput,
+) -> Option<PathBuf> {
+    match output {
+        BackgroundOutput::Challenger => Some(genome_dir.join(format!("{domain_name}.fna"))),
+        BackgroundOutput::Domain => Some(genome_dir.join(format!("_domain.{domain_name}.fna"))),
+        BackgroundOutput::Discard => None,
+    }
+}
+
+#[inline]
+fn writes_background(output: BackgroundOutput, is_target: bool) -> bool {
+    match output {
+        BackgroundOutput::Challenger => true,
+        BackgroundOutput::Domain => !is_target,
+        BackgroundOutput::Discard => false,
+    }
+}
+
+#[inline]
+fn writes_prelim_map(output: BackgroundOutput, is_target: bool) -> bool {
+    output == BackgroundOutput::Challenger || is_target
 }
 
 #[derive(Debug, Default, Clone)]
@@ -150,14 +195,20 @@ pub struct PipelineStats {
     pub genomes_processed: u64,
     pub records_processed: u64,
     pub records_in_target: u64,
+    pub records_in_domain: u64,
+    pub records_ignored_unmapped: u64,
     pub bytes_received: u64,
     pub chunks_masked: u64,
+    pub masker_worker_time: Duration,
+    pub output_write_time: Duration,
 }
 
 pub async fn run_pipeline(
     cfg: PipelineConfig,
     sources: Vec<GenomeSource>,
 ) -> Result<PipelineStats> {
+    let pipeline_started = Instant::now();
+    let report_domain = cfg.domain_name.clone();
     let (chunks_tx, mut chunks_rx) =
         mpsc::channel::<ByteChunk>(cfg.max_in_flight_chunks.max(1));
     let (mask_tx, mut mask_rx) =
@@ -207,7 +258,11 @@ pub async fn run_pipeline(
         })
     };
 
-    let domain_path = cfg.output_genome_dir.join(format!("{}.fna", cfg.domain_name));
+    let background_path = background_path(
+        &cfg.output_genome_dir,
+        &cfg.domain_name,
+        cfg.background_output,
+    );
     let target_shard_path = cfg
         .output_genome_dir
         .join(format!("_target.{}.fna", cfg.domain_name));
@@ -217,17 +272,19 @@ pub async fn run_pipeline(
 
     let sink_custom_map = cfg.custom_map.clone();
     let sink_drop_unmapped = cfg.drop_unmapped;
+    let sink_background_output = cfg.background_output;
 
     let sink_handle: JoinHandle<Result<PipelineStats>> = tokio::spawn(async move {
         run_sink(
             &mut mask_rx,
-            domain_path,
+            background_path,
             target_shard_path,
             sink_relevant,
             sink_shared,
             sink_domain,
             sink_custom_map,
             sink_drop_unmapped,
+            sink_background_output,
         )
         .await
     });
@@ -243,6 +300,19 @@ pub async fn run_pipeline(
     let _chunks_dispatched = mask_res?;
     let bytes_received = dl_res?;
     stats.bytes_received = bytes_received;
+
+    eprintln!(
+        "[{}] Sequence pipeline finished in {:.2?}: {} mapped records, {} target records, {} domain records, {} unmapped records ignored, {} chunks, {:.2?} aggregate mask/parse worker time, {:.2?} output write time.",
+        report_domain,
+        pipeline_started.elapsed(),
+        stats.records_processed,
+        stats.records_in_target,
+        stats.records_in_domain,
+        stats.records_ignored_unmapped,
+        stats.chunks_masked,
+        stats.masker_worker_time,
+        stats.output_write_time
+    );
 
     Ok(stats)
 }
@@ -418,6 +488,7 @@ async fn send_chunk(
 }
 
 async fn eof_worker(chunk: ByteChunk, no_mask: bool) -> Result<MaskedChunk> {
+    let worker_started = Instant::now();
     if no_mask {
         let taxid = chunk.taxid;
         let assembly = chunk.assembly_accession;
@@ -431,6 +502,7 @@ async fn eof_worker(chunk: ByteChunk, no_mask: bool) -> Result<MaskedChunk> {
             records: parsed,
             taxid,
             assembly_accession: assembly,
+            worker_time: worker_started.elapsed(),
         });
     }
 
@@ -495,6 +567,7 @@ async fn eof_worker(chunk: ByteChunk, no_mask: bool) -> Result<MaskedChunk> {
         records: parsed,
         taxid,
         assembly_accession: assembly,
+        worker_time: worker_started.elapsed(),
     })
 }
 
@@ -548,18 +621,24 @@ fn parse_masked_fasta(bytes: &[u8]) -> Result<Vec<MaskedRecord>> {
 
 async fn run_sink(
     mask_rx: &mut mpsc::Receiver<JoinHandle<Result<MaskedChunk>>>,
-    domain_path: PathBuf,
+    background_path: Option<PathBuf>,
     target_shard_path: PathBuf,
     relevant: Arc<HashSet<u32>>,
     shared: Arc<SharedWriters>,
     domain_name: String,
     custom_map: Option<Arc<FxHashMap<String, u32>>>,
     drop_unmapped: bool,
+    background_output: BackgroundOutput,
 ) -> Result<PipelineStats> {
-    let domain_file = TokioFile::create(&domain_path)
-        .await
-        .with_context(|| format!("create {}", domain_path.display()))?;
-    let mut domain_w = TokioBufWriter::with_capacity(8 * 1024 * 1024, domain_file);
+    let mut background_w = match background_path {
+        Some(path) => {
+            let file = TokioFile::create(&path)
+                .await
+                .with_context(|| format!("create {}", path.display()))?;
+            Some(TokioBufWriter::with_capacity(8 * 1024 * 1024, file))
+        }
+        None => None,
+    };
 
     let target_file = TokioFile::create(&target_shard_path)
         .await
@@ -574,7 +653,12 @@ async fn run_sink(
         let masked = handle.await
             .map_err(|e| anyhow!("[{}] masker task panicked: {e}", domain_name))??;
         stats.chunks_masked += 1;
+        stats.masker_worker_time += masked.worker_time;
         seen_assemblies.entry(masked.assembly_accession.clone()).or_insert(());
+
+        let mut background_batch = Vec::new();
+        let mut target_batch = Vec::new();
+        let mut prelim_batch = Vec::with_capacity(masked.records.len());
 
         for mut rec in masked.records {
             lowercase_to_x(&mut rec.seq);
@@ -584,33 +668,53 @@ async fn run_sink(
             if let Some(cmap) = &custom_map {
                 match cmap.get(&rec.record_id) {
                     Some(&tid) => actual_taxid = tid,
-                    None if drop_unmapped => continue,
+                    None if drop_unmapped => {
+                        stats.records_ignored_unmapped += 1;
+                        continue;
+                    }
                     None => {}
                 }
             }
 
             let is_target = relevant.contains(&actual_taxid);
-            
-            domain_w.write_all(b">").await?;
-            domain_w.write_all(&rec.header).await?;
-            domain_w.write_all(b"\n").await?;
-            write_wrapped_fasta_seq(&mut domain_w, &rec.seq, 80).await?;
 
             if is_target {
-                target_w.write_all(b">").await?;
-                target_w.write_all(&rec.header).await?;
-                target_w.write_all(b"\n").await?;
-                write_wrapped_fasta_seq(&mut target_w, &rec.seq, 80).await?;
+                append_fasta_record(&mut target_batch, &rec.header, &rec.seq, 80);
                 stats.records_in_target += 1;
             }
 
-            shared.send_prelim(rec.record_id, actual_taxid)?;
+            if writes_background(background_output, is_target) {
+                append_fasta_record(&mut background_batch, &rec.header, &rec.seq, 80);
+                if background_output == BackgroundOutput::Domain {
+                    stats.records_in_domain += 1;
+                }
+            }
+
+            if writes_prelim_map(background_output, is_target) {
+                prelim_batch.push((rec.record_id, actual_taxid));
+            }
             stats.records_processed += 1;
         }
+
+        let write_started = Instant::now();
+        if let Some(writer) = background_w.as_mut() {
+            if !background_batch.is_empty() {
+                writer.write_all(&background_batch).await?;
+            }
+        }
+        if !target_batch.is_empty() {
+            target_w.write_all(&target_batch).await?;
+        }
+        stats.output_write_time += write_started.elapsed();
+        shared.send_prelim_batch(prelim_batch)?;
     }
 
-    domain_w.flush().await?;
+    let flush_started = Instant::now();
+    if let Some(writer) = background_w.as_mut() {
+        writer.flush().await?;
+    }
     target_w.flush().await?;
+    stats.output_write_time += flush_started.elapsed();
     stats.genomes_processed = seen_assemblies.len() as u64;
     Ok(stats)
 }
@@ -624,19 +728,22 @@ fn lowercase_to_x(seq: &mut [u8]) {
     }
 }
 
-async fn write_wrapped_fasta_seq<W: AsyncWriteExt + Unpin>(
-    w: &mut W,
+fn append_fasta_record(
+    out: &mut Vec<u8>,
+    header: &[u8],
     seq: &[u8],
     width: usize,
-) -> Result<()> {
+) {
+    out.push(b'>');
+    out.extend_from_slice(header);
+    out.push(b'\n');
     let mut i = 0;
     while i < seq.len() {
         let end = (i + width).min(seq.len());
-        w.write_all(&seq[i..end]).await?;
-        w.write_all(b"\n").await?;
+        out.extend_from_slice(&seq[i..end]);
+        out.push(b'\n');
         i = end;
     }
-    Ok(())
 }
 
 fn collect_shards(genome_dir: &Path, prefix: &str, suffix: &str) -> Result<Vec<PathBuf>> {
@@ -715,4 +822,119 @@ pub async fn finalize_shared(
     handles.manifest.await
         .map_err(|e| anyhow!("manifest writer panicked: {e}"))??;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batched_fasta_format_matches_wrapped_output() {
+        let mut out = Vec::new();
+        append_fasta_record(&mut out, b"NC_000001.1 description", b"ACGTACGTAA", 4);
+        assert_eq!(
+            out,
+            b">NC_000001.1 description\nACGT\nACGT\nAA\n"
+        );
+    }
+
+    #[test]
+    fn custom_outputs_are_disjoint() {
+        assert!(!writes_background(BackgroundOutput::Domain, true));
+        assert!(writes_background(BackgroundOutput::Domain, false));
+        assert!(writes_prelim_map(BackgroundOutput::Domain, true));
+        assert!(!writes_prelim_map(BackgroundOutput::Domain, false));
+
+        assert!(!writes_background(BackgroundOutput::Discard, true));
+        assert!(!writes_background(BackgroundOutput::Discard, false));
+    }
+
+    #[tokio::test]
+    async fn custom_sink_partitions_records_and_ignores_unmapped() {
+        let base = std::env::temp_dir().join(format!(
+            "tdkc-custom-partition-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+
+        let (shared, handles) = SharedWriters::new(&base, "sample").unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        let chunk = MaskedChunk {
+            records: vec![
+                MaskedRecord {
+                    record_id: "TARGET.1".to_string(),
+                    header: b"TARGET.1 target".to_vec(),
+                    seq: b"ACGT".to_vec(),
+                },
+                MaskedRecord {
+                    record_id: "OTHER.1".to_string(),
+                    header: b"OTHER.1 other".to_vec(),
+                    seq: b"ACGT".to_vec(),
+                },
+                MaskedRecord {
+                    record_id: "MISSING.1".to_string(),
+                    header: b"MISSING.1 missing".to_vec(),
+                    seq: b"ACGT".to_vec(),
+                },
+            ],
+            taxid: 0,
+            assembly_accession: "sample".to_string(),
+            worker_time: Duration::ZERO,
+        };
+        tx.send(tokio::spawn(async move { Ok(chunk) }))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let custom_map = Arc::new(FxHashMap::from_iter([
+            ("TARGET.1".to_string(), 10),
+            ("OTHER.1".to_string(), 20),
+        ]));
+        let stats = run_sink(
+            &mut rx,
+            Some(base.join("_domain.sample.fna")),
+            base.join("_target.sample.fna"),
+            Arc::new(HashSet::from([10])),
+            Arc::clone(&shared),
+            "sample".to_string(),
+            Some(custom_map),
+            true,
+            BackgroundOutput::Domain,
+        )
+        .await
+        .unwrap();
+        finalize_shared(shared, handles).await.unwrap();
+
+        assert_eq!(stats.records_processed, 2);
+        assert_eq!(stats.records_in_target, 1);
+        assert_eq!(stats.records_in_domain, 1);
+        assert_eq!(stats.records_ignored_unmapped, 1);
+        assert_eq!(
+            std::fs::read(base.join("_target.sample.fna")).unwrap(),
+            b">TARGET.1 target\nACGT\n"
+        );
+        assert_eq!(
+            std::fs::read(base.join("_domain.sample.fna")).unwrap(),
+            b">OTHER.1 other\nACGT\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(base.join("_prelim.sample.txt")).unwrap(),
+            "TARGET.1\t10\n"
+        );
+
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn custom_domain_path_is_excluded_from_challenger_discovery() {
+        let path = background_path(
+            Path::new("genome"),
+            "sample_deadbeef",
+            BackgroundOutput::Domain,
+        )
+        .unwrap();
+        assert_eq!(path, Path::new("genome/_domain.sample_deadbeef.fna"));
+        assert!(path.file_name().unwrap().to_string_lossy().starts_with('_'));
+    }
 }

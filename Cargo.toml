@@ -4,6 +4,14 @@ version = "1.0.1"
 edition = "2021"
 description = "Target Distilled K-mer Classifier"
 
+[lib]
+name = "tdkc"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tdkc"
+path = "src/main.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 boomphf = { version = "0.6", features = ["serde"] }

@@ -92,34 +92,34 @@ pub fn run_build_domain(config: BuildDomainConfig) -> Result<()> {
     let scanner = MinimizerScanner::new(k, l, spaced_seed_mask, toggle_mask);
 
     let none_specified = !config.bacteria && !config.archaea && !config.viral && !config.fungi;
-    let want = |flag: bool| flag || none_specified;
-
-    let candidates = [
-        ("bacteria", config.bacteria),
-        ("archaea", config.archaea),
-        ("viral", config.viral),
-        ("fungi", config.fungi),
-    ];
-
+    let registered = crate::custom::load_domains(&db_path)?;
     let mut tasks = Vec::new();
-    for (slug, flag) in candidates {
-        if !want(flag) {
+
+    for domain in registered {
+        let selected = none_specified || match domain.label.as_str() {
+            "bacteria" => config.bacteria,
+            "archaea" => config.archaea,
+            "viral" | "viruses" => config.viral,
+            "fungi" => config.fungi,
+            _ => false,
+        };
+        if !selected {
             continue;
         }
-        let fasta_path = genome_dir.join(format!("{}.fna", slug));
+        let fasta_path = genome_dir.join(&domain.fasta);
         if !fasta_path.exists() {
-            eprintln!("Can't find {} file", slug);
+            eprintln!("Can't find registered domain file {}", fasta_path.display());
             continue;
         }
         tasks.push(DomainTask {
-            name: slug.into(),
+            name: domain.identity.clone(),
             fasta_path: fasta_path.to_string_lossy().into_owned(),
-            output_ext: format!("{}.bloom", slug),
+            output_ext: format!("{}.bloom", domain.identity),
         });
     }
 
     if tasks.is_empty() {
-        eprintln!("No domains specified.");
+        eprintln!("No registered domains selected. Run `tdkc prep` to populate genome/domains.tsv.");
         return Ok(());
     }
 
@@ -136,7 +136,7 @@ pub fn run_build_domain(config: BuildDomainConfig) -> Result<()> {
 
 fn build_single_domain(task: &DomainTask, scanner: &MinimizerScanner, db_prefix: &str, fpr: f64) -> Result<()> {
     eprintln!("Processing Domain: {}", task.name);
-    let (unique_count, total_seqs) = estimate_unique_minimizers(&task.fasta_path, scanner)?;
+    let (unique_count, _total_seqs) = estimate_unique_minimizers(&task.fasta_path, scanner)?;
 
     if unique_count == 0 {
         eprintln!("WARNING: No valid minimizers found.");

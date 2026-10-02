@@ -6,7 +6,6 @@ use anyhow::{Context, Result};
 use boomphf::Mphf;
 use rustc_hash::FxHashMap;
 use crate::hash::compute_fingerprint;
-use crate::taxonomy::resolve_domain_lca;
 use crate::compression::{delta_vbyte_decode, delta_vbyte_encode, delta_vbyte_skip, vbyte_decode};
 
 pub struct AccessionRegistry {
@@ -461,6 +460,23 @@ impl KmerDatabase {
         self.index_to_taxid.iter().position(|&t| t == taxid).map(|p| p as u8)
     }
 
+    fn resolve_background_lca(&self, taxids: &[u32]) -> u32 {
+        let indices: Vec<usize> = taxids.iter()
+            .filter_map(|taxid| self.index_to_taxid.iter().position(|candidate| candidate == taxid))
+            .collect();
+        if indices.is_empty() { return crate::taxonomy::TAXID_ROOT; }
+        let n = self.index_to_taxid.len();
+        let mut best = None;
+        let mut best_depth = 0usize;
+        for candidate in 0..n {
+            if indices.iter().all(|&descendant| self.ancestor_matrix[candidate * n + descendant] != 0) {
+                let depth = (0..n).filter(|&ancestor| self.ancestor_matrix[ancestor * n + candidate] != 0).count();
+                if depth > best_depth { best = Some(candidate); best_depth = depth; }
+            }
+        }
+        best.map(|idx| self.index_to_taxid[idx]).unwrap_or(crate::taxonomy::TAXID_ROOT)
+    }
+
     pub fn get_taxid_name(&self, taxid: u32) -> String {
         if taxid == u32::MAX {
             return "\t".to_string();
@@ -543,22 +559,17 @@ impl KmerDatabase {
                     bg_taxid: 0,
                 }
             } else {
-                let mut hit_taxids = [0u32; 4]; 
-                let mut match_count = 0;
-
-                for (filter, t_id) in bg_filters {
+                let mut hit_taxids = Vec::new();
+                for (filter, taxid) in bg_filters {
                     if filter.contains(m) {
-                        if match_count < 4 {
-                            hit_taxids[match_count] = *t_id;
-                        }
-                        match_count += 1;
+                        hit_taxids.push(*taxid);
                     }
                 }
 
-                let bg_taxid = match match_count {
+                let bg_taxid = match hit_taxids.len() {
                     0 => 0,
-                    1 => hit_taxids[0], 
-                    _ => resolve_domain_lca(hit_taxids[..match_count.min(4)].iter()),
+                    1 => hit_taxids[0],
+                    _ => self.resolve_background_lca(&hit_taxids),
                 };
 
                 Hit { 
@@ -761,9 +772,82 @@ impl DomainBloomFilter {
     }
 
     pub fn load(path: &str) -> Result<Self> {
+        // `data` is a plain Vec<u8>, and serde has no specialization for byte vectors, so
+        // bincode::deserialize_from walks it as a *sequence* -- one deserialize_u8 call per byte.
+        // On a 42 GB filter that is ~42 billion calls through a BufReader and takes minutes.
+        //
+        // bincode encodes a seq as a fixed-width u64 length followed by the elements, and for u8
+        // elements those are just raw bytes, so the on-disk layout is:
+        //     u64 data_len | data_len raw bytes | u32 num_hashes | u64 num_bits
+        // which we can pull in with bulk reads. Byte-identical to what bincode writes, so existing
+        // .bloom files load unchanged and files written by older builds stay compatible.
         let f = File::open(path)?;
-        let mut reader = BufReader::new(f);
-        bincode::deserialize_from(&mut reader).map_err(Into::into)
+        let file_len = f.metadata()?.len();
+
+        let mut header = [0u8; 8];
+        (&f).read_exact(&mut header)?;
+        let data_len = u64::from_le_bytes(header);
+
+        // Validate the layout before trusting it; fall back to bincode if anything is off (e.g. a
+        // file written with non-default bincode options).
+        let trailer_len = 4 + 8; // num_hashes + num_bits
+        if data_len.checked_add(8 + trailer_len) != Some(file_len) {
+            let mut reader = BufReader::new(File::open(path)?);
+            return bincode::deserialize_from(&mut reader).map_err(Into::into);
+        }
+
+        let mut data = vec![0u8; data_len as usize];
+        read_parallel_at(&f, &mut data, 8)?;
+
+        let mut trailer = [0u8; 12];
+        read_exact_at_offset(&f, &mut trailer, 8 + data_len)?;
+        let num_hashes = u32::from_le_bytes(trailer[0..4].try_into().unwrap());
+        let num_bits = u64::from_le_bytes(trailer[4..12].try_into().unwrap());
+
+        Ok(Self { data, num_hashes, num_bits })
+    }
+}
+
+/// Size of each positioned read when filling a large buffer in parallel.
+const BLOOM_READ_CHUNK: usize = 64 * 1024 * 1024;
+
+/// Fills `buf` from `file` starting at `offset`, using parallel positioned reads when the buffer
+/// is large enough to be worth it. Chunks are disjoint slices of `buf`, so no locking is needed.
+#[cfg(unix)]
+fn read_parallel_at(file: &File, buf: &mut [u8], offset: u64) -> Result<()> {
+    use rayon::prelude::*;
+    use std::os::unix::fs::FileExt;
+
+    if buf.len() <= BLOOM_READ_CHUNK {
+        return file.read_exact_at(buf, offset).map_err(Into::into);
+    }
+
+    buf.par_chunks_mut(BLOOM_READ_CHUNK)
+        .enumerate()
+        .try_for_each(|(i, chunk)| {
+            file.read_exact_at(chunk, offset + (i * BLOOM_READ_CHUNK) as u64)
+        })?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn read_parallel_at(file: &File, buf: &mut [u8], offset: u64) -> Result<()> {
+    read_exact_at_offset(file, buf, offset)
+}
+
+fn read_exact_at_offset(file: &File, buf: &mut [u8], offset: u64) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(buf, offset)?;
+        return Ok(());
+    }
+    #[cfg(not(unix))]
+    {
+        let mut f = file.try_clone()?;
+        f.seek(SeekFrom::Start(offset))?;
+        f.read_exact(buf)?;
+        Ok(())
     }
 }
 
@@ -773,5 +857,91 @@ pub struct Hit {
     pub accession_class_id: Option<u32>,
     pub accession_dense_pos: Option<u32>,
     pub is_hit: bool,
-    pub bg_taxid: u32, 
+    pub bg_taxid: u32,
+}
+
+#[cfg(test)]
+mod bloom_load_tests {
+    use super::*;
+
+    fn write_with_bincode(filter: &DomainBloomFilter, path: &std::path::Path) {
+        let f = File::create(path).unwrap();
+        let mut w = BufWriter::new(f);
+        bincode::serialize_into(&mut w, filter).unwrap();
+        w.flush().unwrap();
+    }
+
+    fn roundtrip(data: Vec<u8>, num_hashes: u32, num_bits: u64) {
+        let dir = std::env::temp_dir().join(format!(
+            "tdkc-bloom-{}-{}",
+            std::process::id(),
+            data.len()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.bloom");
+
+        let original = DomainBloomFilter::new(data.clone(), num_hashes, num_bits);
+        write_with_bincode(&original, &path);
+
+        let loaded = DomainBloomFilter::load(path.to_str().unwrap()).unwrap();
+        assert_eq!(loaded.data, data, "data mismatch for len {}", data.len());
+        assert_eq!(loaded.num_hashes, num_hashes);
+        assert_eq!(loaded.num_bits, num_bits);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn matches_bincode_for_small_filter() {
+        roundtrip((0u8..255).cycle().take(4096).collect(), 13, 32768);
+    }
+
+    #[test]
+    fn matches_bincode_for_empty_filter() {
+        roundtrip(Vec::new(), 1, 0);
+    }
+
+    /// Crosses the parallel-read threshold so the chunked path and its final short chunk are
+    /// both exercised.
+    #[test]
+    fn matches_bincode_across_chunk_boundary() {
+        let len = BLOOM_READ_CHUNK + 12345;
+        let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let num_bits = (len as u64) * 8;
+        roundtrip(data, 13, num_bits);
+    }
+
+    /// A filter loaded by the fast path must answer membership exactly as the in-memory one did.
+    #[test]
+    fn membership_survives_the_fast_load() {
+        let mut data = vec![0u8; 1 << 16];
+        let num_bits = (data.len() as u64) * 8;
+        let num_hashes = 13;
+        // Insert a few items the same way AtomicBloom does.
+        let items: Vec<u64> = (0..64).map(|i| i * 2_654_435_761).collect();
+        for &item in &items {
+            let (h1, h2) = crate::hash::bloom_hash_pair(item);
+            for i in 0..num_hashes {
+                let bit = h1.wrapping_add((i as u64).wrapping_mul(h2)) % num_bits;
+                data[(bit / 8) as usize] |= 1u8 << (bit % 8);
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("tdkc-bloom-mem-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("m.bloom");
+        let original = DomainBloomFilter::new(data, num_hashes, num_bits);
+        write_with_bincode(&original, &path);
+
+        let loaded = DomainBloomFilter::load(path.to_str().unwrap()).unwrap();
+        for &item in &items {
+            assert!(loaded.contains(item), "inserted item {} went missing", item);
+        }
+        // And agree with the original on non-inserted probes, whatever the answer.
+        for probe in 1_000_000u64..1_000_500 {
+            assert_eq!(loaded.contains(probe), original.contains(probe));
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

@@ -7,10 +7,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::Result;
 use rayon::prelude::*;
 use crate::database::{AccessionRegistry, DomainBloomFilter, KmerDatabase, Hit};
+use crate::engine::{Engine, EngineConfig};
 use crate::minimizer::MinimizerScanner;
 use rustc_hash::FxHashMap;
 use itertools::Itertools;
-use crate::utils::init_thread_pool;
 use crate::taxonomy::{TAXID_ARCHAEA, TAXID_BACTERIA, TAXID_FUNGI, TAXID_VIRAL, TAXID_ROOT, TAXID_CELLULAR};
 use read_finder::Sample;
 use std::process::{Command, Stdio};
@@ -76,50 +76,23 @@ struct BatchResult {
 }
 
 pub fn run_query(config: QueryConfig) -> Result<()> {
-    init_thread_pool(config.threads);
+    // The engine owns the loaded database and its own rayon pool.
+    let engine = Engine::load(&EngineConfig {
+        db_dir: config.db_dir.clone(),
+        accessions: config.use_accessions,
+        background: config.background,
+        threads: config.threads,
+    })?;
 
-    let db_prefix = format!("{}/db", config.db_dir);
-    let db = KmerDatabase::load(&db_prefix, config.use_accessions)?;
-
-    let mut bg_filters = Vec::new();
-    if config.background {
-        let domains = [
-            ("bacteria.bloom", TAXID_BACTERIA),
-            ("archaea.bloom", TAXID_ARCHAEA),
-            ("viral.bloom", TAXID_VIRAL),
-            ("fungi.bloom", TAXID_FUNGI)
-        ];
-        for (ext, taxid) in domains {
-            let path = format!("{}.{}", db_prefix, ext);
-            if std::path::Path::new(&path).exists() {
-                eprintln!("Loading background filter: {}", path);
-                if let Ok(filter) = DomainBloomFilter::load(&path) {
-                    bg_filters.push((filter, taxid));
-                } else {
-                    eprintln!("Failed to load {}", path);
-                }
-            }
-        }
-    }
-
-    let acc_path = format!("{}.accessions", db_prefix);
-    let acc_registry = if config.use_accessions {
-        match AccessionRegistry::load_for_query(&acc_path) {
-            Ok(reg) => Some(reg),
-            Err(_) => {
-                eprintln!("No accession registry found, skipping accession output");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let db = engine.db();
+    let bg_filters = engine.bg_filters();
+    let acc_registry = engine.acc_registry();
 
     if config.counts && (acc_registry.is_none() || db.accessions_ref().is_none()) {
         anyhow::bail!("--counts requires an accession database");
     }
 
-    let scanner = MinimizerScanner::new(db.k(),db.l(),db.spaced_seed_mask,db.toggle_mask);
+    let scanner = engine.scanner();
     let classify_start = std::time::Instant::now();
     let num_samples = config.samples.len();
 
@@ -216,20 +189,23 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
         });
 
         //par_bridge() let's channel to give batch to rayon thread whenever it's free
-        batch_rx.into_iter().par_bridge().for_each(|batch| {
-            let result = classify_batch(
-                &batch,
-                &db,
-                &scanner,
-                &acc_registry,
-                config.minimum_hit_groups,
-                is_paired,
-                &bg_filters,
-                config.no_output,
-                config.domain_penalty,
-                seen_bits.as_deref(),
-            );
-            let _ = writer_tx.send(result);
+        // install() runs this on the engine's own pool instead of rayon's global one.
+        engine.install(|| {
+            batch_rx.into_iter().par_bridge().for_each(|batch| {
+                let result = classify_batch(
+                    &batch,
+                    db,
+                    scanner,
+                    acc_registry,
+                    config.minimum_hit_groups,
+                    is_paired,
+                    bg_filters,
+                    config.no_output,
+                    config.domain_penalty,
+                    seen_bits.as_deref(),
+                );
+                let _ = writer_tx.send(result);
+            });
         });
 
         drop(writer_tx);

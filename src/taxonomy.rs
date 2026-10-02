@@ -62,6 +62,10 @@ impl TaxonomyTree {
     pub fn children(&self) -> &HashMap<u32, Vec<u32>> {
         &self.children
     }
+
+    pub fn contains(&self, taxid: u32) -> bool {
+        self.parent.contains_key(&taxid)
+    }
 }
 
 // This is Kraken2 style assigning internal IDs to the nodes. This is only used for tracking in full-taxon setting.
@@ -249,24 +253,4 @@ pub fn lookup_names(
         }
     }
     Ok(())
-}
-
-#[inline]
-pub fn resolve_domain_lca<'a>(taxids: impl Iterator<Item = &'a u32>) -> u32 {
-    let mut hit_viral = false;
-    let mut hit_cellular = false;
-
-    for &t in taxids {
-        if t == TAXID_VIRAL || t == TAXID_ROOT { 
-            hit_viral = true; 
-        }
-        if t == TAXID_BACTERIA || t == TAXID_ARCHAEA || t == TAXID_FUNGI || t == TAXID_CELLULAR { 
-            hit_cellular = true; 
-        }
-    }
-
-    if hit_viral && hit_cellular { TAXID_ROOT } 
-    else if hit_cellular { TAXID_CELLULAR } 
-    else if hit_viral { TAXID_VIRAL } 
-    else { TAXID_ROOT }
 }

@@ -24,6 +24,7 @@ pub struct BuildConfig {
     pub k: usize,
     pub l: usize,
     pub names_dmp_path: String,
+    pub domain_taxids: Vec<u32>,
 }
 
 const NUM_SHARDS: usize = 256;
@@ -32,6 +33,39 @@ const BATCH_ITEM_LIMIT: usize = 2048;
 const BATCH_BYTE_LIMIT: usize = 256 * 1024 * 1024;
 const PAR_CHUNK_SIZE: usize = 64;
 const SEG_TARGET_LEN: usize = 4 * 1024 * 1024;
+const MAX_REPORT_TAXIDS: usize = 255;
+const CORE_REPORT_TAXIDS: [u32; 6] = [
+    crate::taxonomy::TAXID_ROOT,
+    crate::taxonomy::TAXID_CELLULAR,
+    crate::taxonomy::TAXID_BACTERIA,
+    crate::taxonomy::TAXID_ARCHAEA,
+    crate::taxonomy::TAXID_FUNGI,
+    crate::taxonomy::TAXID_VIRAL,
+];
+
+fn validate_report_taxid_capacity(targets: &HashSet<u32>, domain_taxids: &[u32]) -> Result<()> {
+    let mut reserved_taxids: BTreeSet<u32> = CORE_REPORT_TAXIDS.into_iter().collect();
+    reserved_taxids.extend(domain_taxids.iter().copied());
+
+    let additional_reserved = reserved_taxids
+        .iter()
+        .filter(|taxid| !targets.contains(taxid))
+        .count();
+    let total = targets.len() + additional_reserved;
+
+    if total > MAX_REPORT_TAXIDS {
+        anyhow::bail!(
+            "Too many reportable taxids: {} targets + {} additional core/domain taxids = {} distinct taxids (max {}). Remove at least {} target(s) or domain taxid(s) before building.",
+            targets.len(),
+            additional_reserved,
+            total,
+            MAX_REPORT_TAXIDS,
+            total - MAX_REPORT_TAXIDS,
+        );
+    }
+
+    Ok(())
+}
 
 pub fn run_build(config: BuildConfig) -> Result<()> {
     let spaced_seed_mask = create_spaced_seed_mask(SPACED_PATTERN);
@@ -39,11 +73,12 @@ pub fn run_build(config: BuildConfig) -> Result<()> {
 
     let total_start = Instant::now();
 
-    eprintln!("Loading taxonomy...");
-    let taxonomy = TaxonomyTree::load(&config.nodes_file)?;
-
     eprintln!("Loading target TaxIDs...");
     let targets = load_target_taxids(&config.targets_file)?;
+    validate_report_taxid_capacity(&targets, &config.domain_taxids)?;
+
+    eprintln!("Loading taxonomy...");
+    let taxonomy = TaxonomyTree::load(&config.nodes_file)?;
     let taxid_manager = TargetTaxIDManager::new(&targets, &taxonomy);
 
     // Roll up 
@@ -52,7 +87,9 @@ pub fn run_build(config: BuildConfig) -> Result<()> {
     let bfs_tax = BfsTaxonomy::build(&taxonomy, &relevant_taxids);
     // taxID to name matcher
     let name_file = format!("{}.names", config.db_prefix);
-    crate::taxonomy::lookup_names(&config.names_dmp_path, &targets, &name_file)?;
+    let mut named_taxids = targets.clone();
+    named_taxids.extend(config.domain_taxids.iter().copied());
+    crate::taxonomy::lookup_names(&config.names_dmp_path, &named_taxids, &name_file)?;
     
     eprintln!("\nLoading prelim_map...");
     let acc_to_taxid = load_prelim_map(&config.prelim_map_file)?;
@@ -148,6 +185,7 @@ pub fn run_build(config: BuildConfig) -> Result<()> {
         spaced_seed_mask,
         TOGGLE_MASK,
         config.track_accessions,
+        &config.domain_taxids,
     )?;
 
     db.save(&config.db_prefix)?;
@@ -174,6 +212,7 @@ fn build_database_from_shards(
     spaced_seed_mask: u64,
     toggle_mask: u64,
     track_accessions: bool,
+    domain_taxids: &[u32],
 ) -> Result<KmerDatabase> {
     let start = Instant::now();
     eprintln!("\nBuilding k-mer database");
@@ -192,25 +231,19 @@ fn build_database_from_shards(
             num_minimizers += 1;
         }
     }
-    let core_domains = [
-        crate::taxonomy::TAXID_ROOT,
-        crate::taxonomy::TAXID_CELLULAR,
-        crate::taxonomy::TAXID_BACTERIA,
-        crate::taxonomy::TAXID_ARCHAEA,
-        crate::taxonomy::TAXID_FUNGI,
-        crate::taxonomy::TAXID_VIRAL,
-    ];
-    for &domain in &core_domains {
+    for &domain in &CORE_REPORT_TAXIDS {
         unique_taxids.insert(domain);
     }
+    unique_taxids.extend(domain_taxids.iter().copied());
     
     eprintln!("Found {} unique taxIDs", unique_taxids.len());
     eprintln!("{} unique minimizers", num_minimizers);
 
-    if unique_taxids.len() > 255 {
+    if unique_taxids.len() > MAX_REPORT_TAXIDS {
         anyhow::bail!(
-            "Too many unique taxids ({}) for u8 storage (max 255)",
-            unique_taxids.len()
+            "Too many unique taxids ({}) for u8 storage (max {})",
+            unique_taxids.len(),
+            MAX_REPORT_TAXIDS,
         );
     }
     if num_minimizers == 0 {
@@ -261,7 +294,7 @@ fn build_database_from_shards(
     let mut hash_to_class: FxHashMap<u64, u32> = FxHashMap::default();
     let mut build_map: FxHashMap<u32, u32> = FxHashMap::default();
 
-    for (shard_idx, shard_lock) in global.shards.into_iter().enumerate() {
+    for (_shard_idx, shard_lock) in global.shards.into_iter().enumerate() {
         let shard = shard_lock.into_inner().unwrap();
 
         for (minimizer, entry) in shard {
@@ -741,5 +774,48 @@ fn challenge_bulk_remove(global: &ShardedMinimizerMap, to_remove: &[u64]) {
         for m in removals {
             shard.remove(&m);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn targets(count: usize) -> HashSet<u32> {
+        (100_000..).take(count).collect()
+    }
+
+    #[test]
+    fn report_taxid_capacity_accepts_exact_limit_and_deduplicates_domains() {
+        let mut target_taxids = targets(248);
+        target_taxids.insert(777);
+
+        assert!(validate_report_taxid_capacity(
+            &target_taxids,
+            &[777, 777, crate::taxonomy::TAXID_VIRAL],
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn report_taxid_capacity_rejects_before_build_work() {
+        let error = validate_report_taxid_capacity(&targets(250), &[]).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Too many reportable taxids: 250 targets + 6 additional core/domain taxids = 256 distinct taxids (max 255). Remove at least 1 target(s) or domain taxid(s) before building."
+        );
+    }
+
+    #[test]
+    fn empty_challenger_set_is_valid() {
+        let scanner = MinimizerScanner::new(
+            35,
+            31,
+            create_spaced_seed_mask(SPACED_PATTERN),
+            TOGGLE_MASK,
+        );
+        let global = ShardedMinimizerMap::new();
+        let hits = collect_background_hits(&[], &HashSet::new(), &scanner, &global).unwrap();
+        assert!(hits.is_empty());
     }
 }

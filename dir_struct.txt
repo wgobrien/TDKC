@@ -1,0 +1,70 @@
+Default output structure for:
+
+    tdkc prep --targets file
+
+tdkc_db/
+|-- targets.txt
+|-- target.fasta
+|-- prelim_map.txt
+|-- taxonomy/
+|   |-- nodes.dmp
+|   |-- names.dmp
+|   |-- nucl_gb.accession2taxid
+|   `-- nucl_wgs.accession2taxid
+`-- genome/
+    |-- bacteria.fna
+    |-- viral.fna
+    |-- archaea.fna
+    |-- human.fna
+    |-- plasmid.fna
+    |-- univec_core.fna
+    |-- manifest.tsv
+    |
+    |-- .bacteria.done
+    |-- .viral.done
+    |-- .archaea.done
+    |-- .human.done
+    |-- .plasmid.done
+    |-- .univec_core.done
+    |
+    |-- _target.bacteria.fna
+    |-- _target.viral.fna
+    |-- _target.archaea.fna
+    |-- _target.human.fna
+    |-- _target.plasmid.fna
+    |-- _target.univec_core.fna
+    |
+    |-- _prelim.bacteria.txt
+    |-- _prelim.viral.txt
+    |-- _prelim.archaea.txt
+    |-- _prelim.human.txt
+    |-- _prelim.plasmid.txt
+    |-- _prelim.univec_core.txt
+    |
+    |-- _manifest.bacteria.tsv
+    |-- _manifest.viral.tsv
+    |-- _manifest.archaea.tsv
+    |-- _manifest.human.tsv
+    |-- _manifest.plasmid.tsv
+    `-- _manifest.univec_core.tsv
+
+Custom additions use content-hashed, disjoint shards such as:
+
+    genome/_target.sample_a1b2c3d4e5f6.fna
+    genome/_domain.sample_a1b2c3d4e5f6.fna  # only with --domain
+
+Notes:
+
+- The default database directory is tdkc_db/.
+- The default domains are bacteria, viral, archaea, human, and plasmid.
+- univec_core is automatically included.
+- targets.txt is a copy of the supplied target-taxid file.
+- target.fasta combines the per-domain _target.*.fna shards.
+- prelim_map.txt combines the per-domain _prelim.*.txt shards.
+- genome/manifest.tsv combines the per-domain _manifest.*.tsv shards.
+- The .DOMAIN.done files allow completed domains to be skipped on reruns.
+- Custom `_target.*.fna` records feed the target database. Custom `_domain.*.fna`
+  records are excluded from the main challenger and are used only by build-domain.
+- genome/.plasmid_cache/ may exist temporarily, but is removed after successful
+  plasmid processing.
+- The db.* index files are created later by tdkc build, not by tdkc prep.

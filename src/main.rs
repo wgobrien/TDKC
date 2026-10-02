@@ -1,16 +1,16 @@
-mod build;
-mod database;
-mod minimizer;
-mod prep;
-mod query;
-mod taxonomy;
-mod utils;
-mod build_domain;
-mod compression;
-mod hash;
-mod inspect;
+use tdkc::{build, build_domain, custom, inspect, prep, query, serve};
 use clap::{Parser, Subcommand};
 use anyhow::Context;
+
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("'{value}' is not a valid positive integer"))?;
+    if parsed == 0 {
+        return Err("value must be at least 1".to_string());
+    }
+    Ok(parsed)
+}
 
 #[derive(Parser)]
 #[command(name = "tdkc")]
@@ -25,8 +25,8 @@ struct Cli {
 enum Commands {
     Prep {
         /// You can download archaea, bacteria, viral, fungi, invertebrate, plant, protozoa, human, plasmid, univec_core, or none
-        #[arg(long, default_value = "bacteria,viral,archaea,human,plasmid")]
-        domains: String,
+        #[arg(long, conflicts_with = "custom")]
+        domains: Option<String>,
 
         #[arg(short = 't', long)]
         targets: String,
@@ -43,9 +43,26 @@ enum Commands {
         #[arg(long, default_value_t = 2)]
         in_flight_chunks: usize,
 
-        /// Optional path to a custom FASTA file to include alongside RefSeq downloads
+        /// CPU workers used for accession-to-taxid lookup
+        #[arg(
+            short = 'j',
+            long,
+            default_value_t = num_cpus::get(),
+            value_parser = parse_positive_usize
+        )]
+        threads: usize,
+
+        /// Local FASTA to process without downloading RefSeq or UniVec sequences
         #[arg(long)]
         custom: Option<String>,
+
+        /// Register the custom FASTA as a query-time domain
+        #[arg(long, requires = "custom")]
+        domain: bool,
+
+        /// Reporting taxid when a custom domain name cannot be inferred
+        #[arg(long, requires = "domain")]
+        domain_taxid: Option<u32>,
 
         /// Skip dustmasker low-complexity masking
         #[arg(long)]
@@ -143,6 +160,29 @@ enum Commands {
         output: String,
     },
 
+    /// Keep the database resident in memory and answer sequence batches over a socket or stdio
+    Serve {
+        #[arg(short = 'd', long)]
+        db: String,
+
+        #[arg(short = 'j', long, default_value_t = num_cpus::get())]
+        threads: usize,
+
+        /// Unix socket to listen on
+        #[arg(long, required_unless_present = "stdio", conflicts_with = "stdio")]
+        socket: Option<String>,
+
+        /// Serve a single session over stdin/stdout instead of a socket
+        #[arg(long)]
+        stdio: bool,
+
+        #[arg(short = 'a', long = "accession-tracking")]
+        accession: bool,
+
+        #[arg(short = 'b', long)]
+        background: bool,
+    },
+
 }
 
 #[tokio::main]
@@ -157,7 +197,10 @@ async fn main() -> anyhow::Result<()> {
             backend,
             concurrent_downloads,
             in_flight_chunks,
+            threads,
             custom,
+            domain,
+            domain_taxid,
             no_mask,
         } => {
             prep::run_prep(prep::PrepConfig {
@@ -167,7 +210,10 @@ async fn main() -> anyhow::Result<()> {
                 backend,
                 concurrent_downloads,
                 in_flight_chunks,
+                threads,
                 custom_fasta: custom,
+                custom_domain: domain,
+                domain_taxid,
                 no_mask,
             }).await?;
         }
@@ -196,9 +242,7 @@ async fn main() -> anyhow::Result<()> {
                 fasta_files.push(path.to_string_lossy().into_owned());
             }
 
-            if fasta_files.is_empty() {
-                anyhow::bail!("I can't find any .fna files inside your db, are you sure you downloaded the genome files?");
-            }
+            fasta_files.sort();
 
             build::run_build(build::BuildConfig {
                 fasta_files,
@@ -207,6 +251,7 @@ async fn main() -> anyhow::Result<()> {
                 targets_file: db_path.join("targets.txt").to_string_lossy().into_owned(),
                 nodes_file: db_path.join("taxonomy/nodes.dmp").to_string_lossy().into_owned(),
                 names_dmp_path: db_path.join("taxonomy/names.dmp").to_string_lossy().into_owned(),
+                domain_taxids: custom::load_domains(&db_path)?.into_iter().map(|d| d.taxid).collect(),
                 db_prefix: db_path.join("db").to_string_lossy().into_owned(),
                 threads,
                 track_accessions: accession,
@@ -290,6 +335,24 @@ async fn main() -> anyhow::Result<()> {
             inspect::run_inspect(inspect::InspectConfig {
                 db_dir: db,
                 output,
+            })?;
+        }
+
+        Commands::Serve {
+            db,
+            threads,
+            socket,
+            stdio,
+            accession,
+            background,
+        } => {
+            serve::run_serve(serve::ServeConfig {
+                db_dir: db,
+                threads,
+                use_accessions: accession,
+                background,
+                socket,
+                stdio,
             })?;
         }
     }

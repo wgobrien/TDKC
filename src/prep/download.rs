@@ -1,13 +1,16 @@
+use std::fs::File as StdFile;
+use std::io::{BufRead as _, BufReader as StdBufReader, Read as _, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context as _, Result};
 use async_compression::tokio::bufread::GzipDecoder;
 use async_trait::async_trait;
-use rustc_hash::FxHashMap;
+use rayon::prelude::*;
+use rustc_hash::{FxHashMap, FxHashSet};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter, ReadBuf};
 use tokio_util::io::StreamReader;
@@ -429,32 +432,200 @@ pub async fn fetch_acc2taxid_filtered(
     backend: &Arc<dyn Backend>,
     wanted: &std::collections::HashSet<String>,
     tax_dir: &Path,
+    threads: usize,
 ) -> Result<FxHashMap<String, u32>> {
-    let mut out: FxHashMap<String, u32> = FxHashMap::default();
     if wanted.is_empty() {
-        return Ok(out);
+        return Ok(FxHashMap::default());
     }
 
+    let mut local_paths = Vec::with_capacity(ACC2TAXID_SOURCES.len());
     for src in ACC2TAXID_SOURCES {
-        if out.len() >= wanted.len() {
-            break;
-        }
         let remote = format!("/pub/taxonomy/accession2taxid/{}", src);
         let local = tax_dir.join(src.trim_end_matches(".gz"));
-
         if !local.exists() {
             ensure_acc2taxid_on_disk(backend, &remote, &local).await?;
         }
+        local_paths.push(local);
+    }
 
-        let f = tokio::fs::File::open(&local).await
-            .with_context(|| format!("open acc2taxid {}", local.display()))?;
-        let new_entries = stream_acc2taxid_into(f, wanted).await?;
+    let wanted: FxHashSet<Vec<u8>> = wanted
+        .iter()
+        .map(|accession| accession.as_bytes().to_vec())
+        .collect();
+    let wanted_count = wanted.len();
+    let worker_count = threads.max(1);
+    let lookup_started = Instant::now();
+    let out = tokio::task::spawn_blocking(move || -> Result<FxHashMap<Vec<u8>, u32>> {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(worker_count)
+            .thread_name(|idx| format!("tdkc-acc2taxid-{idx}"))
+            .build()
+            .context("build accession lookup thread pool")?;
+        pool.install(|| {
+            let mut unresolved = wanted;
+            let mut out: FxHashMap<Vec<u8>, u32> = FxHashMap::default();
+            for path in local_paths {
+                if unresolved.is_empty() {
+                    break;
+                }
+                let bytes = std::fs::metadata(&path)?.len();
+                let source_started = Instant::now();
+                eprintln!(
+                    "Scanning {} ({}) for {} unresolved accessions with {} threads...",
+                    path.display(),
+                    format_bytes(bytes),
+                    unresolved.len(),
+                    worker_count
+                );
+                let hits = scan_acc2taxid_file(
+                    &path,
+                    Arc::new(unresolved.clone()),
+                    worker_count,
+                    64 * 1024 * 1024,
+                )?;
+                let hit_count = hits.len();
+                for (accession, taxid) in hits {
+                    out.entry(accession).or_insert(taxid);
+                }
+                unresolved.retain(|accession| !out.contains_key(accession.as_slice()));
+                eprintln!(
+                    "Scanned {} in {:.2?}: {} hits, {} unresolved.",
+                    path.display(),
+                    source_started.elapsed(),
+                    hit_count,
+                    unresolved.len()
+                );
+            }
+            Ok(out)
+        })
+    })
+    .await
+    .context("accession lookup worker panicked")??;
 
-        for (k, v) in new_entries {
-            out.entry(k).or_insert(v);
+    let mut string_out = FxHashMap::default();
+    for (accession, taxid) in out {
+        let accession = String::from_utf8(accession)
+            .context("NCBI accession table contains a non-UTF-8 accession")?;
+        string_out.insert(accession, taxid);
+    }
+    eprintln!(
+        "Resolved {} of {} accessions in {:.2?}.",
+        string_out.len(),
+        wanted_count,
+        lookup_started.elapsed()
+    );
+    Ok(string_out)
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.1} GiB", bytes as f64 / GIB)
+    } else {
+        format!("{:.1} MiB", bytes as f64 / MIB)
+    }
+}
+
+fn scan_acc2taxid_file(
+    path: &Path,
+    wanted: Arc<FxHashSet<Vec<u8>>>,
+    threads: usize,
+    min_range_bytes: u64,
+) -> Result<FxHashMap<Vec<u8>, u32>> {
+    let file_len = std::fs::metadata(path)
+        .with_context(|| format!("stat acc2taxid {}", path.display()))?
+        .len();
+    if file_len == 0 {
+        return Ok(FxHashMap::default());
+    }
+    let max_ranges = threads.max(1).saturating_mul(4);
+    let ranges_for_size = file_len.div_ceil(min_range_bytes.max(1)) as usize;
+    let range_count = max_ranges.min(ranges_for_size.max(1));
+    let range_size = file_len.div_ceil(range_count as u64);
+    let ranges: Vec<(u64, u64)> = (0..range_count)
+        .map(|idx| {
+            let start = idx as u64 * range_size;
+            let end = ((idx + 1) as u64 * range_size).min(file_len);
+            (start, end)
+        })
+        .filter(|(start, end)| start < end)
+        .collect();
+
+    let partials: Vec<Result<FxHashMap<Vec<u8>, u32>>> = ranges
+        .into_par_iter()
+        .map(|(start, end)| scan_acc2taxid_range(path, &wanted, start, end))
+        .collect();
+
+    let mut out = FxHashMap::default();
+    for partial in partials {
+        for (accession, taxid) in partial? {
+            out.entry(accession).or_insert(taxid);
         }
     }
     Ok(out)
+}
+
+fn scan_acc2taxid_range(
+    path: &Path,
+    wanted: &FxHashSet<Vec<u8>>,
+    start: u64,
+    end: u64,
+) -> Result<FxHashMap<Vec<u8>, u32>> {
+    let mut file = StdFile::open(path)
+        .with_context(|| format!("open acc2taxid {}", path.display()))?;
+    let mut position = start;
+    let starts_on_boundary = if start == 0 {
+        true
+    } else {
+        file.seek(SeekFrom::Start(start - 1))?;
+        let mut previous = [0u8; 1];
+        file.read_exact(&mut previous)?;
+        previous[0] == b'\n'
+    };
+    file.seek(SeekFrom::Start(start))?;
+    let mut reader = StdBufReader::with_capacity(4 * 1024 * 1024, file);
+    let mut line = Vec::with_capacity(128);
+    if !starts_on_boundary {
+        position += reader.read_until(b'\n', &mut line)? as u64;
+    }
+
+    let mut hits = FxHashMap::default();
+    while position < end {
+        line.clear();
+        let n = reader.read_until(b'\n', &mut line)?;
+        if n == 0 {
+            break;
+        }
+        position += n as u64;
+        if let Some((accession, taxid)) = parse_acc2taxid_line(&line) {
+            if wanted.contains(accession) {
+                hits.entry(accession.to_vec()).or_insert(taxid);
+            }
+        }
+    }
+    Ok(hits)
+}
+
+fn parse_acc2taxid_line(line: &[u8]) -> Option<(&[u8], u32)> {
+    let mut fields = line.splitn(4, |byte| *byte == b'\t');
+    fields.next()?;
+    let accession = fields.next()?;
+    let taxid = parse_u32_ascii(fields.next()?)?;
+    Some((accession, taxid))
+}
+
+fn parse_u32_ascii(bytes: &[u8]) -> Option<u32> {
+    let mut value = 0u32;
+    let mut found_digit = false;
+    for &byte in bytes {
+        if !byte.is_ascii_digit() {
+            break;
+        }
+        found_digit = true;
+        value = value.checked_mul(10)?.checked_add((byte - b'0') as u32)?;
+    }
+    found_digit.then_some(value)
 }
 
 async fn ensure_acc2taxid_on_disk(
@@ -486,50 +657,6 @@ async fn ensure_acc2taxid_on_disk(
     Ok(())
 }
 
-async fn stream_acc2taxid_into<R>(
-    rdr: R,
-    wanted: &std::collections::HashSet<String>,
-) -> Result<Vec<(String, u32)>>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut buffered = BufReader::with_capacity(4 * 1024 * 1024, rdr);
-    let mut line = String::new();
-    let mut first = true;
-    let mut hits = Vec::new();
-    loop {
-        line.clear();
-        let n = tokio::io::AsyncBufReadExt::read_line(&mut buffered, &mut line).await?;
-        if n == 0 {
-            break;
-        }
-        if first {
-            first = false;
-            if line.starts_with("accession") {
-                continue; // header
-            }
-        }
-        let mut it = line.split('\t');
-        let _acc = it.next();
-        let acc_ver = match it.next() {
-            Some(s) => s,
-            None => continue,
-        };
-        let taxid_str = match it.next() {
-            Some(s) => s.trim(),
-            None => continue,
-        };
-        if !wanted.contains(acc_ver) {
-            continue;
-        }
-        let taxid: u32 = match taxid_str.parse() {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        hits.push((acc_ver.to_string(), taxid));
-    }
-    Ok(hits)
-}
 
 pub struct UnivecMetadata {
     pub fetch_path: String,
@@ -642,4 +769,57 @@ pub async fn stream_local_gz(path: &str) -> Result<(BoxedReader, ShaHandle)> {
     let buffered = BufReader::new(rdr);
     let decoder = GzipDecoder::new(buffered);
     Ok((Box::pin(decoder), h))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn fixture_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "tdkc-{name}-{}-{:?}.tsv",
+            std::process::id(),
+            std::thread::current().id()
+        ))
+    }
+
+    #[test]
+    fn parses_accession_rows_as_bytes() {
+        assert_eq!(
+            parse_acc2taxid_line(b"NC_000001\tNC_000001.11\t9606\t1\r\n"),
+            Some((&b"NC_000001.11"[..], 9606))
+        );
+        assert_eq!(parse_acc2taxid_line(b"accession\taccession.version\ttaxid\tgi\n"), None);
+        assert_eq!(parse_acc2taxid_line(b"broken\trow\n"), None);
+        assert_eq!(parse_acc2taxid_line(b"A\tA.1\tnot-a-taxid\t0\n"), None);
+    }
+
+    #[test]
+    fn parallel_ranges_match_single_range_at_boundaries() {
+        let path = fixture_path("acc2taxid-ranges");
+        let mut file = StdFile::create(&path).unwrap();
+        writeln!(file, "accession\taccession.version\ttaxid\tgi").unwrap();
+        for idx in 0..200 {
+            writeln!(file, "A{idx:06}\tA{idx:06}.1\t{}\t0", 1000 + idx).unwrap();
+        }
+        writeln!(file, "MALFORMED").unwrap();
+        writeln!(file, "Z999999\tZ999999.2\t9999\t0").unwrap();
+        drop(file);
+
+        let wanted: Arc<FxHashSet<Vec<u8>>> = Arc::new(
+            ["A000000.1", "A000057.1", "A000199.1", "Z999999.2", "MISSING.1"]
+                .into_iter()
+                .map(|value| value.as_bytes().to_vec())
+                .collect(),
+        );
+        let serial = scan_acc2taxid_file(&path, Arc::clone(&wanted), 1, u64::MAX).unwrap();
+        let parallel = scan_acc2taxid_file(&path, wanted, 4, 31).unwrap();
+        assert_eq!(parallel, serial);
+        assert_eq!(parallel.len(), 4);
+        assert_eq!(parallel.get(b"A000057.1".as_slice()), Some(&1057));
+        assert_eq!(parallel.get(b"Z999999.2".as_slice()), Some(&9999));
+
+        std::fs::remove_file(path).unwrap();
+    }
 }
