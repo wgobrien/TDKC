@@ -25,6 +25,9 @@ use anyhow::{Context, Result};
 
 use crate::engine::{Engine, EngineConfig};
 
+mod progress;
+use progress::ServerProgress;
+
 /// Sentinel in the `n_seqs` slot marking an error response.
 const ERROR_TAG: u32 = u32::MAX;
 
@@ -59,56 +62,68 @@ pub fn run_serve(config: ServeConfig) -> Result<()> {
         config.threads
     );
 
+    let progress = Arc::new(ServerProgress::new());
     if config.stdio {
-        eprintln!("READY stdio");
+        progress.message("READY stdio");
         let stdin = std::io::stdin();
         let stdout = std::io::stdout();
-        return serve_connection(&engine, stdin.lock(), stdout.lock());
+        let result = serve_connection(&engine, stdin.lock(), stdout.lock(), &progress);
+        if result.is_ok() {
+            progress.finish();
+        } else {
+            progress.end_line();
+        }
+        return result;
     }
 
     let socket_path = config
         .socket
         .as_deref()
         .context("serve needs either --socket <path> or --stdio")?;
-    serve_socket(engine, socket_path)
+    serve_socket(engine, socket_path, progress)
 }
 
 #[cfg(unix)]
-fn serve_socket(engine: Arc<Engine>, socket_path: &str) -> Result<()> {
+fn serve_socket(
+    engine: Arc<Engine>,
+    socket_path: &str,
+    progress: Arc<ServerProgress>,
+) -> Result<()> {
     use std::os::unix::net::UnixListener;
 
     // A leftover socket file from a previous run would make bind() fail with EADDRINUSE.
     match std::fs::remove_file(socket_path) {
-        Ok(()) => eprintln!("Removed stale socket {}", socket_path),
+        Ok(()) => progress.message(&format!("Removed stale socket {}", socket_path)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e).context(format!("Can't clear existing socket {}", socket_path)),
     }
 
     let listener = UnixListener::bind(socket_path)
         .with_context(|| format!("Can't bind socket {}", socket_path))?;
-    eprintln!("READY {}", socket_path);
+    progress.message(&format!("READY {}", socket_path));
 
     for stream in listener.incoming() {
         let stream = match stream {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("Rejected connection: {}", e);
+                progress.message(&format!("Rejected connection: {}", e));
                 continue;
             }
         };
 
         // Arc clone only; the database itself is never copied.
         let engine = Arc::clone(&engine);
+        let progress = Arc::clone(&progress);
         std::thread::spawn(move || {
             let write_half = match stream.try_clone() {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("Connection dropped: {}", e);
+                    progress.message(&format!("Connection dropped: {}", e));
                     return;
                 }
             };
-            if let Err(e) = serve_connection(&engine, stream, write_half) {
-                eprintln!("Connection ended: {}", e);
+            if let Err(e) = serve_connection(&engine, stream, write_half, &progress) {
+                progress.message(&format!("Connection ended: {}", e));
             }
         });
     }
@@ -117,12 +132,21 @@ fn serve_socket(engine: Arc<Engine>, socket_path: &str) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn serve_socket(_engine: Arc<Engine>, _socket_path: &str) -> Result<()> {
+fn serve_socket(
+    _engine: Arc<Engine>,
+    _socket_path: &str,
+    _progress: Arc<ServerProgress>,
+) -> Result<()> {
     anyhow::bail!("Unix socket serving is only available on unix; use --stdio instead")
 }
 
 /// Handles requests on one connection until the peer closes it.
-fn serve_connection<R: Read, W: Write>(engine: &Engine, read: R, write: W) -> Result<()> {
+fn serve_connection<R: Read, W: Write>(
+    engine: &Engine,
+    read: R,
+    write: W,
+    progress: &ServerProgress,
+) -> Result<()> {
     let mut reader = BufReader::with_capacity(1 << 20, read);
     let mut writer = BufWriter::with_capacity(1 << 20, write);
 
@@ -132,16 +156,14 @@ fn serve_connection<R: Read, W: Write>(engine: &Engine, read: R, write: W) -> Re
             None => return Ok(()), // clean EOF between requests
         };
 
-        let start = std::time::Instant::now();
+        progress.start();
+        let sequences = seqs.len();
+        let bases = seqs.iter().map(|seq| seq.len() as u64).sum();
         let results = engine.query_batch(&seqs);
-        eprintln!(
-            "Answered {} sequences in {:.3}ms",
-            results.len(),
-            start.elapsed().as_secs_f64() * 1000.0
-        );
 
         write_response(&mut writer, &results)?;
         writer.flush()?;
+        progress.completed(sequences, bases);
     }
 }
 
@@ -153,14 +175,24 @@ fn read_request<R: Read>(reader: &mut R) -> Result<Option<Vec<Vec<u8>>>> {
     };
 
     if n_seqs > MAX_SEQS_PER_BATCH {
-        anyhow::bail!("Batch of {} sequences exceeds the {} limit", n_seqs, MAX_SEQS_PER_BATCH);
+        anyhow::bail!(
+            "Batch of {} sequences exceeds the {} limit",
+            n_seqs,
+            MAX_SEQS_PER_BATCH
+        );
     }
 
     let mut seqs = Vec::with_capacity(n_seqs as usize);
     for i in 0..n_seqs {
-        let len = read_u32(reader).with_context(|| format!("Truncated length for sequence {}", i))?;
+        let len =
+            read_u32(reader).with_context(|| format!("Truncated length for sequence {}", i))?;
         if len > MAX_SEQ_LEN {
-            anyhow::bail!("Sequence {} of {} bytes exceeds the {} limit", i, len, MAX_SEQ_LEN);
+            anyhow::bail!(
+                "Sequence {} of {} bytes exceeds the {} limit",
+                i,
+                len,
+                MAX_SEQ_LEN
+            );
         }
         let mut seq = vec![0u8; len as usize];
         reader
@@ -272,5 +304,53 @@ mod tests {
         expected.extend_from_slice(&9606u32.to_le_bytes());
         expected.extend_from_slice(&0u32.to_le_bytes()); // n_kmers seq 1
         assert_eq!(out, expected);
+    }
+
+    fn test_engine() -> Arc<Engine> {
+        Engine::load(&EngineConfig {
+            db_dir: "data/influenza_test_db".to_string(),
+            accessions: false,
+            background: false,
+            threads: 1,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn session_responses_are_unchanged_and_count_only_completed_work() {
+        let engine = test_engine();
+        let seqs: Vec<Vec<u8>> = vec![b"ACGT".to_vec(), vec![b'A'; 50]];
+        let request = frame(&[&seqs[0], &seqs[1]]);
+        let mut requests = request.clone();
+        requests.extend_from_slice(&request);
+        let mut expected = Vec::new();
+        write_response(&mut expected, &engine.query_batch(&seqs)).unwrap();
+        let expected = expected.repeat(2);
+        let mut output = Vec::new();
+        let progress = ServerProgress::new();
+        serve_connection(&engine, requests.as_slice(), &mut output, &progress).unwrap();
+        assert_eq!(output, expected);
+        assert_eq!(progress.totals(), (2, 4, 108));
+    }
+
+    #[test]
+    fn failed_response_flush_is_not_counted_as_completed_work() {
+        struct FailingFlush;
+        impl Write for FailingFlush {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "peer closed",
+                ))
+            }
+        }
+        let engine = test_engine();
+        let bytes = frame(&[b"ACGT"]);
+        let progress = ServerProgress::new();
+        assert!(serve_connection(&engine, bytes.as_slice(), FailingFlush, &progress).is_err());
+        assert_eq!(progress.totals(), (0, 0, 0));
     }
 }

@@ -321,7 +321,6 @@ pub async fn download_taxdump(
 pub struct GenomeEntry {
     pub assembly_accession: String,
     pub taxid: u32,
-    pub asm_name: String,
     pub ftp_path: String, // the format is like https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/.../GCF_xxx_yyy
 }
 
@@ -389,7 +388,6 @@ pub async fn fetch_assembly_summary(
             Err(_) => continue,
         };
         let assembly_level = cols[11].trim();
-        let asm_name = cols[15].trim();
         let ftp_path = cols[19].trim();
 
         // Match Kraken2 : keep only Complete Genome /Chromosome assemblies
@@ -407,7 +405,6 @@ pub async fn fetch_assembly_summary(
         out.push(GenomeEntry {
             assembly_accession: acc.to_string(),
             taxid,
-            asm_name: asm_name.to_string(),
             ftp_path: ftp_path.to_string(),
         });
     }
