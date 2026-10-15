@@ -98,7 +98,11 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
 
     // Takes in either single FASTQ file or a dir of FASTQ files
     for sample in config.samples {
-        let is_paired = sample.r2.is_some();
+        let interleaved = sample.interleaved;
+        if interleaved && sample.r2.is_some() {
+            anyhow::bail!("Interleaved sample '{}' cannot also have an R2 file", sample.name);
+        }
+        let is_paired = interleaved || sample.r2.is_some();
         let r1_path = sample.r1.to_string_lossy().to_string();
         let r2_path = sample.r2.as_ref().map(|p| p.to_string_lossy().to_string());
 
@@ -178,7 +182,9 @@ pub fn run_query(config: QueryConfig) -> Result<()> {
         let (batch_tx, batch_rx) = crossbeam_channel::bounded::<ReadBatch>(config.threads * 2);
 
         let reader_handle = std::thread::spawn(move || -> Result<()> {
-            if let Some(ref r2_path_str) = r2_path {
+            if interleaved {
+                read_interleaved_batches(&r1_path, batch_size, &batch_tx, config.gzip_multithreaded)?;
+            } else if let Some(ref r2_path_str) = r2_path {
                 read_paired_batches(&r1_path, r2_path_str, batch_size, &batch_tx, config.gzip_multithreaded)?;
             } else {
                 read_single_batches(&r1_path, batch_size, &batch_tx, config.gzip_multithreaded)?;
@@ -611,6 +617,129 @@ fn read_single_batches(r1_path: &str, batch_size: usize, tx: &crossbeam_channel:
     Ok(())
 }
 
+// Borrow header slices: validation adds no per-pair string allocations.
+fn pair_header(header: &[u8]) -> (&[u8], Option<u8>, bool) {
+    let split = header
+        .iter()
+        .position(|b| b.is_ascii_whitespace())
+        .unwrap_or(header.len());
+    let mut id = &header[..split];
+    let suffix = if id.ends_with(b"/1") || id.ends_with(b"/2") {
+        let mate = id[id.len() - 1];
+        id = &id[..id.len() - 2];
+        Some(mate)
+    } else {
+        None
+    };
+    let metadata = header[split..]
+        .split(|b| b.is_ascii_whitespace())
+        .find(|s| !s.is_empty());
+    let label = metadata.and_then(|s| {
+        if s.len() >= 2 && s[1] == b':' && (s[0] == b'1' || s[0] == b'2') {
+            Some(s[0])
+        } else {
+            None
+        }
+    });
+    (
+        id,
+        suffix.or(label),
+        suffix.is_some() && label.is_some() && suffix != label,
+    )
+}
+
+fn matching_pair_headers(first: &[u8], second: &[u8]) -> bool {
+    let (id1, mate1, conflict1) = pair_header(first);
+    let (id2, mate2, conflict2) = pair_header(second);
+    id1 == id2
+        && !conflict1
+        && !conflict2
+        && mate1.map_or(true, |m| m == b'1')
+        && mate2.map_or(true, |m| m == b'2')
+}
+
+fn append_flat_record(batch: &mut FlatBatch, header: &[u8], seq: &[u8]) {
+    let h_start = batch.data.len();
+    batch.data.extend_from_slice(header);
+    let h_end = batch.data.len();
+    batch.data.extend_from_slice(seq);
+    batch
+        .offsets
+        .push((h_start, h_end, h_end, batch.data.len()));
+}
+
+fn read_interleaved_batches(
+    path: &str,
+    batch_size: usize,
+    tx: &crossbeam_channel::Sender<ReadBatch>,
+    gzip_multithreaded: bool,
+) -> Result<()> {
+    use anyhow::Context;
+    let mut reader = if gzip_multithreaded {
+        open_fastx_fast(path)
+    } else {
+        open_fastx(path)
+    }
+    .with_context(|| format!("Interleaved input {}", path))?;
+    let mut pair_number = 0usize;
+    loop {
+        let mut batch1 = FlatBatch {
+            data: Vec::with_capacity(batch_size * 250),
+            offsets: Vec::with_capacity(batch_size),
+        };
+        let mut batch2 = FlatBatch {
+            data: Vec::with_capacity(batch_size * 250),
+            offsets: Vec::with_capacity(batch_size),
+        };
+        for _ in 0..batch_size {
+            let Some(first) = reader.next() else {
+                break;
+            };
+            pair_number += 1;
+            let first = first
+                .with_context(|| format!("{}: pair {}: invalid first mate", path, pair_number))?;
+            let seq = first.seq();
+            if seq.is_empty() {
+                anyhow::bail!("{}: pair {}: empty first mate sequence", path, pair_number);
+            }
+            append_flat_record(&mut batch1, first.id(), &seq);
+            let second = reader
+                .next()
+                .with_context(|| format!("{}: pair {}: missing second mate", path, pair_number))?
+                .with_context(|| format!("{}: pair {}: invalid second mate", path, pair_number))?;
+            let (h_start, h_end, _, _) = *batch1.offsets.last().unwrap();
+            let first_header = &batch1.data[h_start..h_end];
+            if !matching_pair_headers(first_header, second.id()) {
+                anyhow::bail!(
+                    "{}: pair {}: mismatched IDs or mate labels: '{}' and '{}'",
+                    path,
+                    pair_number,
+                    String::from_utf8_lossy(first_header),
+                    String::from_utf8_lossy(second.id())
+                );
+            }
+            let seq = second.seq();
+            if seq.is_empty() {
+                anyhow::bail!("{}: pair {}: empty second mate sequence", path, pair_number);
+            }
+            append_flat_record(&mut batch2, second.id(), &seq);
+        }
+        if batch1.offsets.is_empty() {
+            break;
+        }
+        if tx
+            .send(ReadBatch {
+                batch1,
+                batch2: Some(batch2),
+            })
+            .is_err()
+        {
+            break;
+        }
+    }
+    Ok(())
+}
+
 fn read_paired_batches(r1_path: &str, r2_path: &str, batch_size: usize, tx: &crossbeam_channel::Sender<ReadBatch>, gzip_multithreaded: bool) -> Result<()> {
     let (r2_tx, r2_rx) = crossbeam_channel::bounded::<Option<FlatBatch>>(4);
     let r2_path_owned = r2_path.to_string();
@@ -719,4 +848,203 @@ fn read_flat_batch(reader: &mut FastxReader, n: usize) -> Result<FlatBatch> {
     }
 
     Ok(FlatBatch { data, offsets })
+}
+
+#[cfg(test)]
+mod interleaved_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    static NEXT_FILE: AtomicUsize = AtomicUsize::new(0);
+
+    fn read_input(data: &[u8], gzip: bool, batch_size: usize) -> (Result<()>, Vec<ReadBatch>) {
+        let path = std::env::temp_dir().join(format!(
+            "tdkc-interleaved-{}-{}.{}",
+            std::process::id(),
+            NEXT_FILE.fetch_add(1, Ordering::Relaxed),
+            if gzip { "fq.gz" } else { "fq" }
+        ));
+        if gzip {
+            let mut writer = flate2::write::GzEncoder::new(
+                File::create(&path).unwrap(),
+                flate2::Compression::default(),
+            );
+            writer.write_all(data).unwrap();
+            writer.finish().unwrap();
+        } else {
+            std::fs::write(&path, data).unwrap();
+        }
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let result = read_interleaved_batches(path.to_str().unwrap(), batch_size, &tx, false);
+        drop(tx);
+        let batches = rx.into_iter().collect();
+        std::fs::remove_file(path).unwrap();
+        (result, batches)
+    }
+
+    #[test]
+    fn header_conventions() {
+        for (a, b) in [
+            ("SRR24948974.135", "SRR24948974.135"),
+            ("read/1", "read/2"),
+            ("read 1:N:0:ATGC", "read 2:N:0:ATGC"),
+            ("read/1 1:N:0:ATGC", "read/2 2:N:0:ATGC"),
+        ] {
+            assert!(
+                matching_pair_headers(a.as_bytes(), b.as_bytes()),
+                "{a}, {b}"
+            );
+        }
+        for (a, b) in [
+            ("read1", "read2"),
+            ("read/2", "read/1"),
+            ("read/1", "read/1"),
+            ("read 2:N:0:A", "read 1:N:0:A"),
+            ("read/1 2:N:0:A", "read/2 2:N:0:A"),
+        ] {
+            assert!(
+                !matching_pair_headers(a.as_bytes(), b.as_bytes()),
+                "{a}, {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn complete_pairs_across_batches_plain_and_gzip() {
+        let input = b"@a/1\nACGT\n+\nIIII\n@a/2\nTGCA\n+\nIIII\n@b/1\nAAAA\n+\nIIII\n@b/2\nCCCC\n+\nIIII\n@c/1\nGGGG\n+\nIIII\n@c/2\nTTTT\n+\nIIII\n";
+        for gzip in [false, true] {
+            for batch_size in [1, 2, 3, 4] {
+                let (result, batches) = read_input(input, gzip, batch_size);
+                result.unwrap();
+                assert_eq!(
+                    batches
+                        .iter()
+                        .map(|b| b.batch1.offsets.len())
+                        .sum::<usize>(),
+                    3
+                );
+                let mut observed = Vec::new();
+                for batch in batches {
+                    let b2 = batch.batch2.unwrap();
+                    assert_eq!(batch.batch1.offsets.len(), b2.offsets.len());
+                    for (one, two) in batch.batch1.offsets.iter().zip(&b2.offsets) {
+                        observed.push((
+                            batch.batch1.data[one.0..one.1].to_vec(),
+                            b2.data[two.0..two.1].to_vec(),
+                        ));
+                    }
+                }
+                assert_eq!(
+                    observed,
+                    vec![
+                        (b"a/1".to_vec(), b"a/2".to_vec()),
+                        (b"b/1".to_vec(), b"b/2".to_vec()),
+                        (b"c/1".to_vec(), b"c/2".to_vec())
+                    ]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn interleaved_matches_split_classification() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("tdkc-parity-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let result = (|| -> Result<()> {
+            let fixture = std::fs::read_to_string(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/data/test_reads/mock.fastq"
+            ))?;
+            let records: Vec<_> = fixture.lines().collect();
+            let mut r1 = String::new();
+            let mut r2 = String::new();
+            let mut interleaved = String::new();
+            for (i, record) in records.chunks_exact(4).enumerate() {
+                let one = format!("@pair{}/1\n{}\n+\n{}\n", i, record[1], record[3]);
+                let two = format!(
+                    "@pair{}/2\n{}\n+\n{}\n",
+                    i,
+                    record[1].chars().rev().collect::<String>(),
+                    record[3]
+                );
+                r1.push_str(&one);
+                r2.push_str(&two);
+                interleaved.push_str(&one);
+                interleaved.push_str(&two);
+            }
+            std::fs::write(dir.join("r1.fq"), r1)?;
+            std::fs::write(dir.join("r2.fq"), r2)?;
+            std::fs::write(dir.join("interleaved.fq"), interleaved)?;
+            for (mode, use_accessions, counts, no_output) in [
+                ("default", false, false, false),
+                ("accessions", true, true, false),
+                ("report_only", false, false, true),
+            ] {
+                for interleaved in [false, true] {
+                    run_query(QueryConfig {
+                        db_dir: concat!(env!("CARGO_MANIFEST_DIR"), "/data/influenza_test_db")
+                            .to_string(),
+                        samples: vec![Sample {
+                            name: "sample".to_string(),
+                            r1: dir.join(if interleaved {
+                                "interleaved.fq"
+                            } else {
+                                "r1.fq"
+                            }),
+                            r2: if interleaved {
+                                None
+                            } else {
+                                Some(dir.join("r2.fq"))
+                            },
+                            interleaved,
+                        }],
+                        threads: 1,
+                        use_accessions,
+                        background: false,
+                        minimum_hit_groups: 2,
+                        output_prefix: dir
+                            .join(format!("{}-{}", mode, interleaved))
+                            .to_string_lossy()
+                            .into_owned(),
+                        no_output,
+                        gzip_multithreaded: false,
+                        domain_penalty: 1,
+                        counts,
+                    })?;
+                }
+                let mut extensions = vec!["report"];
+                if !no_output {
+                    extensions.push("output");
+                }
+                if counts {
+                    extensions.push("strain.txt");
+                }
+                for extension in extensions {
+                    assert_eq!(
+                        std::fs::read(dir.join(format!("{}-false.{}", mode, extension)))?,
+                        std::fs::read(dir.join(format!("{}-true.{}", mode, extension)))?,
+                        "{mode}: {extension}"
+                    );
+                }
+            }
+            Ok(())
+        })();
+        std::fs::remove_dir_all(dir)?;
+        result
+    }
+
+    #[test]
+    fn rejects_broken_pairs_with_context() {
+        for input in [
+            &b"@a\nACGT\n+\nIIII\n"[..],
+            &b"@a\nACGT\n+\nIIII\n@b\nACGT\n+\nIIII\n"[..],
+            &b"@a\nACGT\n+\nIIII\n@a\nACGT\n+\nI\n"[..],
+            &b"@a\n\n+\n\n@a\nACGT\n+\nIIII\n"[..],
+        ] {
+            let (result, _) = read_input(input, false, 2);
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(error.contains("pair 1"), "{error}");
+            assert!(error.contains("tdkc-interleaved-"), "{error}");
+        }
+    }
 }

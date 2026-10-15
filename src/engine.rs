@@ -53,6 +53,17 @@ pub struct Engine {
     load_time: Duration,
 }
 
+// Coarse jobs amortize scheduling and keep scratch allocations across requests.
+const QUERY_CHUNK_SIZE: usize = 256;
+
+// Neighboring jobs must not contend over cache lines containing mutable Vec metadata.
+#[repr(align(128))]
+#[derive(Default)]
+pub(crate) struct BatchScratch {
+    minimizers: Vec<u64>,
+    hits: Vec<Hit>,
+}
+
 impl Engine {
     /// Load a database into memory.
     ///
@@ -76,11 +87,12 @@ impl Engine {
 
         let mut bg_filters = Vec::new();
         if cfg.background {
-            let paths: Vec<(String, u32)> = crate::custom::load_domains(std::path::Path::new(&cfg.db_dir))?
-                .into_iter()
-                .map(|d| (format!("{}.{}.bloom", db_prefix, d.identity), d.taxid))
-                .filter(|(p, _)| std::path::Path::new(p).exists())
-                .collect();
+            let paths: Vec<(String, u32)> =
+                crate::custom::load_domains(std::path::Path::new(&cfg.db_dir))?
+                    .into_iter()
+                    .map(|d| (format!("{}.{}.bloom", db_prefix, d.identity), d.taxid))
+                    .filter(|(p, _)| std::path::Path::new(p).exists())
+                    .collect();
 
             // Load the filters concurrently -- they are independent files, and each individual
             // load is itself internally parallel. Results are collected in registry order so
@@ -157,12 +169,93 @@ impl Engine {
         })
     }
 
+    /// Encode the existing per-k-mer wire response directly into a reusable flat buffer.
+    /// Each parallel job owns a disjoint output slice; no per-sequence result allocation.
+    pub(crate) fn query_batch_wire(
+        &self,
+        data: &[u8],
+        ranges: &[std::ops::Range<usize>],
+        output: &mut Vec<u8>,
+        scratch: &mut Vec<BatchScratch>,
+    ) -> Result<()> {
+        let encoded_len = |range: &std::ops::Range<usize>| {
+            let kmers = range.len().checked_sub(self.k()).map_or(0, |n| n + 1);
+            4 + 4 * kmers
+        };
+        let total = ranges.iter().try_fold(4usize, |total, range| {
+            total
+                .checked_add(encoded_len(range))
+                .ok_or_else(|| anyhow::anyhow!("Response size overflow"))
+        })?;
+        output.resize(total, 0);
+        output[..4].copy_from_slice(&(ranges.len() as u32).to_le_bytes());
+        // Keep long-read batches parallel too: cap a job at roughly 32 KiB of input.
+        let bases: usize = ranges.iter().map(|r| r.len()).sum();
+        let average_len = bases / ranges.len().max(1);
+        // Several jobs per worker balance variable lengths and keep small batches parallel.
+        let balanced = ranges.len().div_ceil(self.pool.current_num_threads() * 4);
+        let chunk_size = (32768 / average_len.max(1))
+            .clamp(1, QUERY_CHUNK_SIZE)
+            .min(balanced.max(1));
+        let chunks = ranges.len().div_ceil(chunk_size);
+        if scratch.len() < chunks {
+            scratch.resize_with(chunks, BatchScratch::default);
+        }
+        let mut remaining = &mut output[4..];
+        let mut jobs = Vec::with_capacity(chunks);
+        for (ranges, scratch) in ranges.chunks(chunk_size).zip(scratch.iter_mut()) {
+            let len = ranges.iter().map(encoded_len).sum();
+            let (chunk, rest) = remaining.split_at_mut(len);
+            remaining = rest;
+            jobs.push((ranges, chunk, scratch));
+        }
+        let run = |(ranges, output, scratch): (
+            &[std::ops::Range<usize>],
+            &mut [u8],
+            &mut BatchScratch,
+        )| {
+            let mut remaining = output;
+            for range in ranges {
+                scratch.hits.clear();
+                self.db.query_into(
+                    &self.scanner,
+                    &data[range.clone()],
+                    &mut scratch.minimizers,
+                    &mut scratch.hits,
+                    &self.bg_filters,
+                );
+                let size = 4 + 4 * scratch.hits.len();
+                let (record, rest) = remaining.split_at_mut(size);
+                remaining = rest;
+                record[..4].copy_from_slice(&(scratch.hits.len() as u32).to_le_bytes());
+                for (bytes, hit) in record[4..].chunks_exact_mut(4).zip(&scratch.hits) {
+                    bytes.copy_from_slice(&self.hit_to_taxid(hit).to_le_bytes());
+                }
+            }
+            debug_assert!(remaining.is_empty());
+        };
+        // All connections share the configured worker limit, including small requests.
+        self.pool.install(|| {
+            if jobs.len() <= 1 {
+                jobs.into_iter().for_each(run);
+            } else {
+                jobs.into_par_iter().for_each(run);
+            }
+        });
+        Ok(())
+    }
+
     /// Per-k-mer taxids for a single sequence. Runs on the calling thread.
     pub fn query_one(&self, seq: &[u8]) -> Vec<u32> {
         let mut minimizer_buf = Vec::new();
         let mut hit_buf = Vec::new();
-        self.db
-            .query_into(&self.scanner, seq, &mut minimizer_buf, &mut hit_buf, &self.bg_filters);
+        self.db.query_into(
+            &self.scanner,
+            seq,
+            &mut minimizer_buf,
+            &mut hit_buf,
+            &self.bg_filters,
+        );
         hit_buf.iter().map(|h| self.hit_to_taxid(h)).collect()
     }
 
@@ -237,7 +330,11 @@ mod tests {
     /// Reads the first record's sequence out of the bundled mock FASTQ.
     fn first_mock_read() -> Vec<u8> {
         let text = std::fs::read_to_string("data/test_reads/mock.fastq").expect("mock reads");
-        text.lines().nth(1).expect("sequence line").as_bytes().to_vec()
+        text.lines()
+            .nth(1)
+            .expect("sequence line")
+            .as_bytes()
+            .to_vec()
     }
 
     #[test]
@@ -267,7 +364,11 @@ mod tests {
     fn misses_flatten_to_zero() {
         let engine = test_engine();
         let text = std::fs::read_to_string("data/test_reads/mock.fastq").expect("mock reads");
-        let seq = text.lines().nth(5).expect("second record sequence").as_bytes();
+        let seq = text
+            .lines()
+            .nth(5)
+            .expect("second record sequence")
+            .as_bytes();
         assert_eq!(engine.query_one(seq), vec![0u32; 16]);
     }
 

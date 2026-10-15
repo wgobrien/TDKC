@@ -144,6 +144,28 @@ TDKC auto-detects reads in the directory and processes them sequentially. Output
 
 Outputs: `results/sample.output` (per-read) and `results/sample.report`.
 
+#### Interleaved Paired Reads
+
+Use `--interleaved` when adjacent FASTQ records are the two mates of a pair:
+
+```bash
+tdkc query --db tdkc_db/ -1 sample.fastq.gz --interleaved -j 32 -o results/sample
+
+# Each FASTQ in the directory is an independent interleaved sample.
+tdkc query --db tdkc_db/ -i /data/fastq_dir/ --interleaved -j 32 -o results/
+```
+
+Directory samples are processed alphabetically. Output names retain the full filename
+except `.fastq`, `.fq`, and optional `.gz`; `_R1` and `_R2` files remain separate samples.
+Duplicate sample names are rejected. Without `--interleaved`, existing directory
+mate detection applies.
+
+Pairs must have matching read identifiers, either identical (such as
+`SRR24948974.135`) or ending in `/1` and `/2`. Illumina mate labels after whitespace
+are also checked when present. Mismatched IDs, incorrect mate labels, malformed or
+empty records, and missing mates cause an error. Each pair produces one output
+record and contributes once to report counts. `--interleaved` cannot be used with `-2`.
+
 #### Subtype Classification
 
 If you would like to also classify which specific subtype/strain the sample has,  make sure you built the database with accession tracking (-a).
@@ -170,6 +192,7 @@ Using these flags provides detailed strain-level information:
 | `-d` / `--db` | — | Database directory |
 | `-1` | — | R1 FASTQ (required unless `-i` is used) |
 | `-2` | — | R2 FASTQ (optional, for paired-end) |
+| `--interleaved` | off | Read adjacent paired mates from each `-1` or `-i` FASTQ; conflicts with `-2` |
 | `-i` | — | Input directory of FASTQ files (alternative to `-1`/`-2`) |
 | `-g` | `2` | Min distinct minimizer hit groups |
 | `-a` | off | Output per k-mer accession hits |
@@ -245,6 +268,10 @@ It accepts the same `-a` (accession tracking) and `-b` (background domain filter
 Each connection is handled on its own thread and shares one `Arc<Engine>`, so the database is
 never copied. Batches are dispatched across a single shared rayon pool, meaning both one large
 batch and many concurrent small batches keep all `-j` threads busy.
+
+Connections reuse flat request and response buffers. Classification uses coarse parallel
+chunks with reusable scratch space, and responses are written in bulk. Every k-mer taxid
+is preserved in sequence order; the wire format is unchanged.
 
 ### Wire format
 

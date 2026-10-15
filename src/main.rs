@@ -98,6 +98,10 @@ enum Commands {
         #[arg(short = '2', long, requires = "read1")]
         read2: Option<String>,
 
+        /// Read adjacent, matching records as paired mates in each input FASTQ.
+        #[arg(long, conflicts_with = "read2")]
+        interleaved: bool,
+
         #[arg(short = 'i', long, required_unless_present = "read1")]
         input_dir: Option<String>,
 
@@ -264,6 +268,7 @@ async fn main() -> anyhow::Result<()> {
             db,
             read1,
             read2,
+            interleaved,
             input_dir,
             threads,
             accession,
@@ -279,8 +284,12 @@ async fn main() -> anyhow::Result<()> {
             if let Some(dir_path) = input_dir {
                 std::fs::create_dir_all(&output_prefix)?;
 
-                samples = query::read_finder::discover_samples(std::path::Path::new(&dir_path))?;
-                let paired = samples.iter().filter(|s| s.r2.is_some()).count();
+                samples = if interleaved {
+                    query::read_finder::discover_interleaved_samples(std::path::Path::new(&dir_path))?
+                } else {
+                    query::read_finder::discover_samples(std::path::Path::new(&dir_path))?
+                };
+                let paired = samples.iter().filter(|s| s.interleaved || s.r2.is_some()).count();
                 let single = samples.len() - paired;
                 eprintln!("Detected {} paired-end reads and {} single-end reads", paired, single);
                 
@@ -289,6 +298,7 @@ async fn main() -> anyhow::Result<()> {
                     name: "read".to_string(),
                     r1: std::path::PathBuf::from(r1),
                     r2: read2.map(std::path::PathBuf::from),
+                    interleaved,
                 });
             }
 
@@ -357,4 +367,49 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod interleaved_cli_tests {
+    use super::*;
+
+    #[test]
+    fn interleaved_inputs_and_conflicts() {
+        for input in ["-1", "-i"] {
+            assert!(Cli::try_parse_from([
+                "tdkc",
+                "query",
+                "-d",
+                "db",
+                input,
+                "reads",
+                "--interleaved",
+                "-o",
+                "out"
+            ])
+            .is_ok());
+        }
+        assert!(Cli::try_parse_from([
+            "tdkc",
+            "query",
+            "-d",
+            "db",
+            "-1",
+            "r1",
+            "-2",
+            "r2",
+            "--interleaved",
+            "-o",
+            "out"
+        ])
+        .is_err());
+        assert!(
+            Cli::try_parse_from(["tdkc", "query", "-d", "db", "--interleaved", "-o", "out"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from([
+            "tdkc", "query", "-d", "db", "-1", "r1", "-2", "r2", "-o", "out"
+        ])
+        .is_ok());
+    }
 }

@@ -148,32 +148,41 @@ fn serve_connection<R: Read, W: Write>(
     progress: &ServerProgress,
 ) -> Result<()> {
     let mut reader = BufReader::with_capacity(1 << 20, read);
+    // Keep block buffering for stdio's underlying line-buffered writer as well as sockets.
     let mut writer = BufWriter::with_capacity(1 << 20, write);
 
+    let mut batch = RequestBatch::default();
+    let mut response = Vec::new();
+    let mut scratch = Vec::new();
     loop {
-        let seqs = match read_request(&mut reader)? {
-            Some(seqs) => seqs,
-            None => return Ok(()), // clean EOF between requests
-        };
+        if !read_request_into(&mut reader, &mut batch)? {
+            return Ok(()); // clean EOF between requests
+        }
 
         progress.start();
-        let sequences = seqs.len();
-        let bases = seqs.iter().map(|seq| seq.len() as u64).sum();
-        let results = engine.query_batch(&seqs);
+        let sequences = batch.ranges.len();
+        let bases = batch.ranges.last().map_or(0, |r| r.end as u64);
+        engine.query_batch_wire(&batch.data, &batch.ranges, &mut response, &mut scratch)?;
 
-        write_response(&mut writer, &results)?;
+        writer.write_all(&response)?;
         writer.flush()?;
         progress.completed(sequences, bases);
     }
 }
 
-/// Reads one request frame. `Ok(None)` means the peer closed cleanly at a frame boundary.
-fn read_request<R: Read>(reader: &mut R) -> Result<Option<Vec<Vec<u8>>>> {
+#[derive(Default)]
+struct RequestBatch {
+    data: Vec<u8>,
+    ranges: Vec<std::ops::Range<usize>>,
+}
+
+/// Reuse the connection's contiguous storage instead of allocating one Vec per read.
+/// Returns false for clean EOF at a frame boundary.
+fn read_request_into<R: Read>(reader: &mut R, batch: &mut RequestBatch) -> Result<bool> {
     let n_seqs = match read_u32_opt(reader)? {
         Some(n) => n,
-        None => return Ok(None),
+        None => return Ok(false),
     };
-
     if n_seqs > MAX_SEQS_PER_BATCH {
         anyhow::bail!(
             "Batch of {} sequences exceeds the {} limit",
@@ -181,8 +190,10 @@ fn read_request<R: Read>(reader: &mut R) -> Result<Option<Vec<Vec<u8>>>> {
             MAX_SEQS_PER_BATCH
         );
     }
-
-    let mut seqs = Vec::with_capacity(n_seqs as usize);
+    // Keep the initialized allocation between requests as well as its capacity.
+    batch.ranges.clear();
+    batch.ranges.reserve(n_seqs as usize);
+    let mut end = 0usize;
     for i in 0..n_seqs {
         let len =
             read_u32(reader).with_context(|| format!("Truncated length for sequence {}", i))?;
@@ -194,16 +205,37 @@ fn read_request<R: Read>(reader: &mut R) -> Result<Option<Vec<Vec<u8>>>> {
                 MAX_SEQ_LEN
             );
         }
-        let mut seq = vec![0u8; len as usize];
+        let start = end;
+        end = start
+            .checked_add(len as usize)
+            .context("Request size overflow")?;
+        if batch.data.len() < end {
+            batch.data.resize(end, 0);
+        }
         reader
-            .read_exact(&mut seq)
+            .read_exact(&mut batch.data[start..end])
             .with_context(|| format!("Truncated body for sequence {}", i))?;
-        seqs.push(seq);
+        batch.ranges.push(start..end);
     }
-
-    Ok(Some(seqs))
+    Ok(true)
 }
 
+#[cfg(test)]
+fn read_request<R: Read>(reader: &mut R) -> Result<Option<Vec<Vec<u8>>>> {
+    let mut batch = RequestBatch::default();
+    if !read_request_into(reader, &mut batch)? {
+        return Ok(None);
+    }
+    Ok(Some(
+        batch
+            .ranges
+            .iter()
+            .map(|r| batch.data[r.clone()].to_vec())
+            .collect(),
+    ))
+}
+
+#[cfg(test)]
 fn write_response<W: Write>(writer: &mut W, results: &[Vec<u32>]) -> Result<()> {
     writer.write_all(&(results.len() as u32).to_le_bytes())?;
     for taxids in results {
@@ -331,6 +363,65 @@ mod tests {
         serve_connection(&engine, requests.as_slice(), &mut output, &progress).unwrap();
         assert_eq!(output, expected);
         assert_eq!(progress.totals(), (2, 4, 108));
+    }
+
+    #[test]
+    fn reused_batches_preserve_every_kmer_and_response_order() {
+        let fixture = std::fs::read_to_string("data/test_reads/mock.fastq").unwrap();
+        let hit = fixture.lines().nth(1).unwrap().as_bytes().to_vec();
+        let cases = [
+            Vec::new(),
+            vec![b'A'; 34],
+            vec![b'A'; 35],
+            hit,
+            b"ACGTNacgt".repeat(40),
+            b"ACGT".repeat(12000),
+        ];
+        for threads in [1, 4] {
+            let engine = Engine::load(&EngineConfig {
+                db_dir: "data/influenza_test_db".to_string(),
+                accessions: true,
+                background: false,
+                threads,
+            })
+            .unwrap();
+            let mut requests = Vec::new();
+            let mut expected = Vec::new();
+            let mut sequences = 0;
+            let mut bases = 0;
+            // Grow, shrink, and clear connection buffers, crossing parallel chunk boundaries.
+            for size in [0, 1, 100, 256, 257, 600, 2, 0, 300] {
+                let batch: Vec<_> = (0..size)
+                    .map(|i| cases[i % cases.len()].as_slice())
+                    .collect();
+                requests.extend(frame(&batch));
+                let results: Vec<_> = batch.iter().map(|seq| engine.query_one(seq)).collect();
+                write_response(&mut expected, &results).unwrap();
+                sequences += size as u64;
+                bases += batch.iter().map(|seq| seq.len() as u64).sum::<u64>();
+            }
+            let mut output = Vec::new();
+            let progress = ServerProgress::new();
+            serve_connection(&engine, requests.as_slice(), &mut output, &progress).unwrap();
+            assert_eq!(output, expected);
+            assert_eq!(progress.totals(), (9, sequences, bases));
+        }
+    }
+
+    #[test]
+    fn request_buffer_reuse_ignores_old_tail_and_checks_sequence_limit() {
+        let mut batch = RequestBatch::default();
+        let large = frame(&[&[b'A'; 1000]]);
+        read_request_into(&mut large.as_slice(), &mut batch).unwrap();
+        let ptr = batch.data.as_ptr();
+        let small = frame(&[b"ACGT", b""]);
+        read_request_into(&mut small.as_slice(), &mut batch).unwrap();
+        assert_eq!(batch.data.as_ptr(), ptr);
+        assert_eq!(batch.ranges, [0..4, 4..4]);
+        assert_eq!(&batch.data[batch.ranges[0].clone()], b"ACGT");
+        let mut oversized = 1u32.to_le_bytes().to_vec();
+        oversized.extend_from_slice(&(MAX_SEQ_LEN + 1).to_le_bytes());
+        assert!(read_request_into(&mut oversized.as_slice(), &mut batch).is_err());
     }
 
     #[test]
