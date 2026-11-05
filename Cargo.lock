@@ -1583,7 +1583,7 @@ dependencies = [
 
 [[package]]
 name = "tdkc"
-version = "1.0.1"
+version = "1.1.1"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -1593,6 +1593,7 @@ dependencies = [
  "boomphf",
  "bytes",
  "clap",
+ "crc32fast",
  "crossbeam-channel",
  "dashmap",
  "fastbloom",
@@ -1601,6 +1602,7 @@ dependencies = [
  "hex",
  "hyperloglogplus",
  "itertools",
+ "itoa",
  "libc",
  "memchr",
  "memmap2",

@@ -1,11 +1,11 @@
 //! Resident, thread-safe query engine.
 //!
-//! [`Engine`] owns a fully loaded [`KmerDatabase`] plus its optional domain bloom filters and
+//! [`Engine`] owns a fully loaded [`QueryDb`] plus its optional domain bloom filters and
 //! accession registry, so the expensive one-time load (MPHF deserialization, accession offset
 //! walk, rank-cache rebuild, bloom filter deserialization) is paid once per process instead of
 //! once per invocation.
 //!
-//! `KmerDatabase` has no interior mutability and is already shared by `&`-reference across rayon
+//! `QueryDb` has no interior mutability and is already shared by `&`-reference across rayon
 //! workers in the CLI path, so it is `Sync` and an `Arc<Engine>` can be cloned freely across
 //! connections or threads without copying the database.
 
@@ -15,7 +15,8 @@ use std::time::Duration;
 use anyhow::Result;
 use rayon::prelude::*;
 
-use crate::database::{AccessionRegistry, DomainBloomFilter, Hit, KmerDatabase};
+use crate::database::{AccessionRegistry, DomainBloomFilter};
+use crate::querydb::{Lookup as Hit, QueryDb};
 use crate::minimizer::MinimizerScanner;
 
 /// How to load a resident database.
@@ -45,7 +46,7 @@ impl EngineConfig {
 
 /// A loaded database plus everything needed to answer queries against it.
 pub struct Engine {
-    db: KmerDatabase,
+    db: QueryDb,
     scanner: MinimizerScanner,
     bg_filters: Vec<(DomainBloomFilter, u32)>,
     acc_registry: Option<AccessionRegistry>,
@@ -62,6 +63,7 @@ const QUERY_CHUNK_SIZE: usize = 256;
 pub(crate) struct BatchScratch {
     minimizers: Vec<u64>,
     hits: Vec<Hit>,
+    probes: Vec<u32>,
 }
 
 impl Engine {
@@ -83,16 +85,24 @@ impl Engine {
             .build()?;
 
         let db_prefix = format!("{}/db", cfg.db_dir);
-        let db = KmerDatabase::load(&db_prefix, cfg.accessions)?;
+        let mut db = pool.install(|| QueryDb::load(&db_prefix, cfg.accessions))?;
 
         let mut bg_filters = Vec::new();
         if cfg.background {
-            let paths: Vec<(String, u32)> =
-                crate::custom::load_domains(std::path::Path::new(&cfg.db_dir))?
-                    .into_iter()
+            let domains = crate::custom::load_domains(std::path::Path::new(&cfg.db_dir))?;
+            let mut paths: Vec<(String, u32)> =
+                domains.iter()
                     .map(|d| (format!("{}.{}.bloom", db_prefix, d.identity), d.taxid))
-                    .filter(|(p, _)| std::path::Path::new(p).exists())
                     .collect();
+            if domains.is_empty() {
+                for label in ["bacteria", "archaea", "viral", "fungi"] {
+                    paths.push((
+                        format!("{}.{}.bloom", db_prefix, label),
+                        crate::custom::default_domain_taxid(label).unwrap(),
+                    ));
+                }
+            }
+            paths.retain(|(path, _)| std::path::Path::new(path).exists());
 
             // Load the filters concurrently -- they are independent files, and each individual
             // load is itself internally parallel. Results are collected in registry order so
@@ -115,6 +125,10 @@ impl Engine {
             bg_filters.extend(loaded.into_iter().flatten());
         }
 
+        if !bg_filters.is_empty() {
+            db.add_domain_nodes(&bg_filters.iter().map(|(_, taxid)| *taxid).collect::<Vec<_>>());
+        }
+
         let acc_registry = if cfg.accessions {
             let acc_path = format!("{}.accessions", db_prefix);
             match AccessionRegistry::load_for_query(&acc_path) {
@@ -128,7 +142,7 @@ impl Engine {
             None
         };
 
-        let scanner = MinimizerScanner::new(db.k(), db.l(), db.spaced_seed_mask, db.toggle_mask);
+        let scanner = MinimizerScanner::new(db.k, db.l, db.spaced_seed_mask, db.toggle_mask);
 
         Ok(Arc::new(Engine {
             db,
@@ -152,14 +166,15 @@ impl Engine {
                 .map_init(
                     // Per-worker scratch, reused across every sequence that worker handles.
                     // Allocating these per sequence would dominate at short read lengths.
-                    || (Vec::<u64>::new(), Vec::<Hit>::new()),
-                    |(minimizer_buf, hit_buf), seq| {
+                    || (Vec::<u64>::new(), Vec::<Hit>::new(), Vec::<u32>::new()),
+                    |(minimizer_buf, hit_buf, probes), seq| {
                         hit_buf.clear();
                         self.db.query_into(
                             &self.scanner,
                             seq.as_ref(),
                             minimizer_buf,
                             hit_buf,
+                            probes,
                             &self.bg_filters,
                         );
                         hit_buf.iter().map(|h| self.hit_to_taxid(h)).collect()
@@ -222,6 +237,7 @@ impl Engine {
                     &data[range.clone()],
                     &mut scratch.minimizers,
                     &mut scratch.hits,
+                    &mut scratch.probes,
                     &self.bg_filters,
                 );
                 let size = 4 + 4 * scratch.hits.len();
@@ -249,11 +265,13 @@ impl Engine {
     pub fn query_one(&self, seq: &[u8]) -> Vec<u32> {
         let mut minimizer_buf = Vec::new();
         let mut hit_buf = Vec::new();
+        let mut probes = Vec::new();
         self.db.query_into(
             &self.scanner,
             seq,
             &mut minimizer_buf,
             &mut hit_buf,
+            &mut probes,
             &self.bg_filters,
         );
         hit_buf.iter().map(|h| self.hit_to_taxid(h)).collect()
@@ -277,7 +295,7 @@ impl Engine {
         self.pool.install(f)
     }
 
-    pub fn db(&self) -> &KmerDatabase {
+    pub fn db(&self) -> &QueryDb {
         &self.db
     }
 
@@ -294,11 +312,11 @@ impl Engine {
     }
 
     pub fn k(&self) -> usize {
-        self.db.k()
+        self.db.k
     }
 
     pub fn l(&self) -> usize {
-        self.db.l()
+        self.db.l
     }
 
     /// How long [`Engine::load`] took — the cost a resident process pays once instead of per run.
@@ -399,5 +417,80 @@ mod tests {
         let first = engine.query_batch(&[seq.clone()]);
         let second = engine.query_batch(&[seq]);
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn wide_taxids_and_multiple_custom_background_filters() -> Result<()> {
+        use crate::database::KmerDatabase;
+        use crate::minimizer::{create_spaced_seed_mask, SPACED_PATTERN, TOGGLE_MASK};
+
+        let dir = std::env::temp_dir().join(format!("tdkc-wide-engine-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("genome"))?;
+        let result = (|| -> Result<()> {
+            let seed = create_spaced_seed_mask(SPACED_PATTERN);
+            let scanner = MinimizerScanner::new(35, 31, seed, TOGGLE_MASK);
+            let seq = first_mock_read();
+            let mut keys = Vec::new();
+            scanner.scan_into(&seq, &mut keys);
+            keys.retain(|&m| m != u64::MAX);
+            keys.sort_unstable();
+            keys.dedup();
+            let mphf = boomphf::Mphf::new(2.0, &keys);
+            let mut fingerprints = vec![0; keys.len()];
+            for &key in &keys {
+                fingerprints[mphf.hash(&key) as usize] = crate::hash::compute_fingerprint(key);
+            }
+            let mut taxids: Vec<u32> = (2_000_000..2_000_300).collect();
+            taxids[0] = crate::taxonomy::TAXID_ROOT;
+            let mut ancestors = vec![0; 300 * 300];
+            ancestors[..300].fill(1);
+            for i in 0..300 { ancestors[i * 300 + i] = 1; }
+            // Five custom domains share this parent, exercising LCA beyond four filters.
+            ancestors[302..307].fill(1);
+            KmerDatabase::new(
+                35, 31, seed, TOGGLE_MASK, keys.len(), mphf, fingerprints,
+                vec![299; keys.len()], taxids, ancestors, None, None,
+            ).save(&dir.join("db").to_string_lossy())?;
+            let mut domains = Vec::new();
+            for i in 2..7 {
+                let identity = format!("custom_{i}");
+                let filter = DomainBloomFilter::new(vec![255], 1, 8);
+                std::fs::write(dir.join(format!("db.{identity}.bloom")), bincode::serialize(&filter)?)?;
+                domains.push(crate::custom::CustomDomain {
+                    identity, label: "custom".into(), taxid: 2_000_000 + i,
+                    fasta: String::new(), sha256: String::new(),
+                });
+            }
+            crate::custom::save_domains(&dir, &domains)?;
+            let engine = Engine::load(&EngineConfig {
+                db_dir: dir.to_string_lossy().into_owned(), accessions: false,
+                background: true, threads: 2,
+            })?;
+            assert_eq!(engine.query_one(&seq), vec![2_000_299; seq.len() - 34]);
+            let text = std::fs::read_to_string("data/test_reads/mock.fastq")?;
+            assert_eq!(engine.query_one(text.lines().nth(5).unwrap().as_bytes()), vec![2_000_001; 16]);
+            let mut interrupted = seq.clone();
+            interrupted.extend_from_slice(&[b'N'; 35]);
+            interrupted.extend_from_slice(&seq);
+            let hits = engine.query_one(&interrupted);
+            assert_eq!(&hits[..16], &[2_000_299; 16]);
+            assert!(hits[16..seq.len() + 1].iter().all(|&t| t == 0));
+            assert_eq!(&hits[hits.len() - 16..], &[2_000_299; 16]);
+            assert_eq!(engine.query_batch(&[interrupted.clone()])[0], hits);
+            // Legacy upstream databases discover standard filters without a registry.
+            std::fs::remove_file(dir.join("genome/domains.tsv"))?;
+            for label in ["archaea", "viral"] {
+                let filter = DomainBloomFilter::new(vec![255], 1, 8);
+                std::fs::write(dir.join(format!("db.{label}.bloom")), bincode::serialize(&filter)?)?;
+            }
+            let legacy = Engine::load(&EngineConfig {
+                db_dir: dir.to_string_lossy().into_owned(), accessions: false,
+                background: true, threads: 2,
+            })?;
+            assert_eq!(legacy.query_one(text.lines().nth(5).unwrap().as_bytes()), vec![1; 16]);
+            Ok(())
+        })();
+        std::fs::remove_dir_all(dir)?;
+        result
     }
 }

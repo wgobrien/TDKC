@@ -108,7 +108,7 @@ enum Commands {
         #[arg(short = 'j', long, default_value_t = 1)]
         threads: usize,
 
-        #[arg(short = 'a', long = "accession-tracking", conflicts_with = "no_output")]
+        #[arg(short = 'a', long = "accession-tracking")]
         accession: bool,
 
         #[arg(short = 'g', long, default_value_t = 2)]
@@ -122,6 +122,10 @@ enum Commands {
 
         #[arg(long, help = "only generates .report")]
         no_output: bool,
+
+        #[arg(short = 'z', long = "gzip-output", conflicts_with = "no_output",
+              help = "write the per-read output gzip-compressed (.output.gz, multi-member gzip)")]
+        gzip_output: bool,
 
         #[arg(short = 'f', long, requires = "no_output")]
         fast_gzip_decompression: bool,
@@ -189,8 +193,7 @@ enum Commands {
 
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -207,7 +210,8 @@ async fn main() -> anyhow::Result<()> {
             domain_taxid,
             no_mask,
         } => {
-            prep::run_prep(prep::PrepConfig {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(prep::run_prep(prep::PrepConfig {
                 domains,
                 targets_file: targets,
                 db_dir: db,
@@ -219,7 +223,7 @@ async fn main() -> anyhow::Result<()> {
                 custom_domain: domain,
                 domain_taxid,
                 no_mask,
-            }).await?;
+            }))?;
         }
 
         Commands::Build {
@@ -276,10 +280,15 @@ async fn main() -> anyhow::Result<()> {
             output_prefix,
             background,
             no_output,
+            gzip_output,
             fast_gzip_decompression,
             domain_penalty,
             counts,
         } => {
+            if accession && no_output && !counts {
+                anyhow::bail!("With --no-output, accession tracking (-a) needs at least the count summary: add -c to write <sample>.strain.txt");
+            }
+
             let mut samples = Vec::new();
             if let Some(dir_path) = input_dir {
                 std::fs::create_dir_all(&output_prefix)?;
@@ -315,6 +324,7 @@ async fn main() -> anyhow::Result<()> {
                 output_prefix,
                 background,
                 no_output,
+                gzip_output,
                 gzip_multithreaded: fast_gzip_decompression,
                 domain_penalty,
                 counts,

@@ -14,7 +14,10 @@
 [![Paper](https://img.shields.io/badge/paper-preprint-purple)](https://www.biorxiv.org/content/10.64898/2026.06.05.730319v1)
 [![version](https://img.shields.io/github/v/release/543090lee/TDKC?style=flat-square&labelColor=21262d&color=30363d)](https://github.com/543090lee/TDKC/releases/latest)
 
+[![Bioconda downloads](https://img.shields.io/conda/dn/bioconda/tdkc)](https://anaconda.org/bioconda/tdkc) [![Install with Bioconda](https://img.shields.io/badge/install%20with-bioconda-brightgreen.svg?style=flat)](https://bioconda.github.io/recipes/tdkc/README.html)
+
 [Paper](https://www.biorxiv.org/content/10.64898/2026.06.05.730319v1) · [Getting Started](#quick-start) · [Citation](#citation)
+
 
 </div>
 
@@ -24,13 +27,25 @@
 ---
 ## Installation
 
+### Bioconda
+
+Install TDKC in a new environment:
+
+```bash
+mamba create -n tdkc -c conda-forge -c bioconda tdkc
+mamba activate tdkc
+```
+
+### From source
+
+To build the latest code from this repository:
+
 ```bash
 git clone https://github.com/543090lee/TDKC.git
 cd TDKC
 mamba env create -f environment.yml
 mamba activate tdkc
 cargo install --path .
-
 ```
 
 This installs the tdkc binary to `~/.cargo/bin` (on your `PATH`)
@@ -186,6 +201,8 @@ Using these flags provides detailed strain-level information:
 * `-a`: Includes the per k-mer set of accession hits in .output file
 * `-c`: Generate `results/sample.strain.txt` summary file that includes the per-accession total and unique hit counts for the entire sample
 
+`-c` requires `-a`. If you only want the strain summary and not the (potentially very large) per-read .output file, add `--no-output`: `tdkc query ... -a -c --no-output` writes only `.report` and `.strain.txt`. `-a --no-output` without `-c` is rejected, since nothing would be left to write the accession hits to.
+
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -199,8 +216,9 @@ Using these flags provides detailed strain-level information:
 | `-b` | off | Enable domain-level detection (requires built bloom filters) |
 | `-p` | `1` | Penalty applied to domain hit group prevent FP read classifications |
 | `-f` | off | Enable multithreaded gzip decompression. Recommended for short-read (50-100bp) |
+| `-z` / `--gzip-output` | off | Compress per-read output to `.output.gz`; conflicts with `--no-output` |
 | `-c` | off | Output per-accession total and unique hit counts to .strain.txt |
-| `--no-output` | off | only generates .report |
+| `--no-output` | off | skip the per-read .output file (with `-a` this requires `-c`) |
 
 
 
@@ -209,6 +227,8 @@ Using these flags provides detailed strain-level information:
 ### (Optional) Build Domain Bloom Filters
 
 Domain bloom filters are driven by `<db>/genome/domains.tsv`. `prep` registers every downloaded domain and the disjoint non-target shard of every custom FASTA passed with `--domain`. With no selection flags, `build-domain` builds every registered entry; built-in flags such as `--bacteria` filter registry entries by label, including hashed custom files with that label.
+
+Filters retain minimizers exclusive to their domain taxid by challenging them against the other domain groups in the reference. Registered custom FASTAs participate in this distillation and retain their individual filter filenames. Older databases without a registry use the standard bacteria, archaea, viral, and fungi files.
 
 ```bash
 # Build all available domains
