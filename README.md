@@ -282,16 +282,17 @@ tdkc serve --db tdkc_db/ -j 32 --socket /tmp/tdkc.sock
 tdkc serve --db tdkc_db/ -j 32 --stdio
 ```
 
-It accepts the same `-a` (accession tracking) and `-b` (background domain filters) flags as
-`query`. On startup it prints the database load time and then a `READY <target>` line on stderr.
+It accepts `-a` (return accession classes instead of taxids; requires a database built with
+`-a`) and `-b` (background domain filters). On startup it prints the database load time and
+then a `READY <target>` line on stderr.
 
 Each connection is handled on its own thread and shares one `Arc<Engine>`, so the database is
 never copied. Batches are dispatched across a single shared rayon pool, meaning both one large
 batch and many concurrent small batches keep all `-j` threads busy.
 
 Connections reuse flat request and response buffers. Classification uses coarse parallel
-chunks with reusable scratch space, and responses are written in bulk. Every k-mer taxid
-is preserved in sequence order; the wire format is unchanged.
+chunks with reusable scratch space, and responses are written in bulk. Without `-a`, every
+k-mer taxid is preserved in sequence order and the wire format is unchanged.
 
 ### Wire format
 
@@ -332,6 +333,35 @@ def query(sock_path, seqs):
 
 print(query("/tmp/tdkc.sock", ["TAGTGTGTGCCACTTGTGAACAGATTGCTGATTCACAGCATCGGTCTCAC"]))
 ```
+
+With `tdkc serve --db tdkc_db/ -a --socket /tmp/tdkc.sock`, sequence requests stay the same,
+but the response contains accession classes rather than per-k-mer taxids:
+
+```text
+Response: n_seqs, n_seqs * ( n_kmers, n_classes,
+                           n_classes * ( class_id, hit_kmers ) )
+```
+
+Each sequence lists its distinct nonempty classes in ascending `class_id` order, with the
+number of k-mers hitting each class. K-mers without a class still count in `n_kmers`.
+Empty sequences and sequences shorter than `k` return `n_kmers=0, n_classes=0`.
+Sequences remain in request order. Accessions are tracked per **minimizer**, so these are
+candidate accessions, not confirmation that an accession contains the exact full k-mer.
+Class IDs are valid only for the database that issued them and may change after rebuilding.
+
+Fetch the class table once per database by sending `0xFFFF_FFFE` as the request's `n_seqs`,
+with no request body. All counts, lengths and IDs below are little-endian `u32`:
+
+```text
+Response: n_accessions, n_accessions * ( name_len, name bytes ),
+          n_classes, n_classes * ( n_ids, n_ids * accession_id )
+```
+
+Names are UTF-8 without terminators. Accession IDs and class IDs are zero-based positions
+in their respective tables; class 0 is empty. Resolve a read's class IDs through the class
+table, then map accession IDs to names and take their union to obtain its candidate set.
+No accession sets are decoded per read on the server. Without `-a`, a class-table request
+returns the error frame described above; the connection remains usable.
 
 ### Embedding in Rust
 

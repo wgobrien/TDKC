@@ -693,7 +693,7 @@ fn write_hit_pattern(out: &mut Vec<u8>, sc: &mut Scratch, rs: u32, re: u32, ctx:
             cur_class = cls;
             run_len = len;
             first = false;
-        } else if t == cur_taxid {
+        } else if t == cur_taxid && (ctx.acc_registry.is_none() || cls == cur_class) {
             run_len += len;
         } else {
             emit_run(out, cur_taxid, run_len, cur_class, ctx, &mut sc.acc_buf, &mut sc.itoa);
@@ -995,6 +995,70 @@ fn read_flat_batch(reader: &mut FastxReader, n: usize) -> Result<FlatBatch> {
 mod interleaved_tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn same_taxid_preserves_accession_class_changes() {
+        let engine = Engine::load(&EngineConfig {
+            db_dir: "data/influenza_test_db".into(),
+            accessions: true,
+            background: false,
+            threads: 1,
+        })
+        .unwrap();
+        let index = engine.db().accessions.as_ref().unwrap();
+        assert!(index.num_classes() > 1);
+        let taxid_idx = engine
+            .db()
+            .index_to_taxid
+            .iter()
+            .position(|t| *t != 0)
+            .unwrap() as TaxIdx;
+        let taxid = engine.db().true_taxid(taxid_idx);
+        let mut sc = Scratch::new(1);
+        for (class_id, len) in [(u32::MAX, 2), (u32::MAX, 3), (1, 7)] {
+            sc.runs.push((0, len));
+            sc.run_lookup.push(sc.lookups.len() as u32);
+            let mut hit = Lookup::new(0);
+            hit.is_hit = true;
+            hit.taxid_idx = taxid_idx;
+            hit.class_id = class_id;
+            sc.lookups.push(hit);
+        }
+        for accessions in [false, true] {
+            let ctx = ClassifyCtx {
+                db: engine.db(),
+                scanner: engine.scanner(),
+                acc_registry: if accessions {
+                    engine.acc_registry().as_ref()
+                } else {
+                    None
+                },
+                min_hit_groups: 2,
+                bg_filters: &[],
+                no_output: false,
+                gzip_output: false,
+                domain_penalty: 1,
+            };
+            let mut out = Vec::new();
+            write_hit_pattern(&mut out, &mut sc, 0, 3, &ctx);
+            let text = String::from_utf8(out).unwrap();
+            if accessions {
+                let tokens: Vec<_> = text.split_whitespace().collect();
+                assert_eq!(tokens.len(), 2);
+                assert_eq!(tokens[0], format!("{}:5", taxid));
+                let mut ids = Vec::new();
+                index.decode_class_into(1, &mut ids);
+                assert!(!ids.is_empty());
+                let names: Vec<_> = ids
+                    .iter()
+                    .map(|id| ctx.acc_registry.unwrap().get_name(*id))
+                    .collect();
+                assert_eq!(tokens[1], format!("{}-{{{}}}:7", taxid, names.join(",")));
+            } else {
+                assert_eq!(text, format!("{}:12 ", taxid));
+            }
+        }
+    }
 
     static NEXT_FILE: AtomicUsize = AtomicUsize::new(0);
 

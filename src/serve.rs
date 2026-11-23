@@ -12,8 +12,18 @@
 //! ```text
 //! Request:   n_seqs, then n_seqs * ( len, len bytes of sequence )
 //! Response:  n_seqs, then n_seqs * ( n_kmers, n_kmers * taxid )
+//! With -a:  n_seqs, then n_seqs * ( n_kmers, n_classes,
+//!                                  n_classes * ( class_id, hit_kmers ) )
+//! Table request: 0xFFFF_FFFE (instead of n_seqs, no body)
+//! Table response: n_accessions, n_accessions * ( name_len, name bytes ),
+//!                 n_classes, n_classes * ( n_ids, n_ids * accession_id )
 //! Error:     0xFFFF_FFFF, then msg_len, msg_len bytes of UTF-8
 //! ```
+//!
+//! Classes are sorted by ID within each sequence; unclassed k-mers still count in n_kmers.
+//! Table positions are zero-based accession/class IDs, including the empty class at ID 0.
+//! Accessions are per minimizer and therefore candidates, not exact full-k-mer matches.
+//! Class IDs are valid only for the database that issued them. Table requests require -a.
 //!
 //! Binary rather than JSON because the payload is per-k-mer `u32` vectors on the hot path; a
 //! client can decode a response body with a single `numpy.frombuffer`.
@@ -30,6 +40,7 @@ use progress::ServerProgress;
 
 /// Sentinel in the `n_seqs` slot marking an error response.
 const ERROR_TAG: u32 = u32::MAX;
+const CLASS_TABLE_TAG: u32 = u32::MAX - 1;
 
 /// Guards against a malformed or hostile frame causing a huge allocation.
 const MAX_SEQS_PER_BATCH: u32 = 10_000_000;
@@ -53,6 +64,12 @@ pub fn run_serve(config: ServeConfig) -> Result<()> {
         background: config.background,
         threads: config.threads,
     })?;
+    if config.use_accessions {
+        anyhow::ensure!(
+            engine.db().accessions.is_some() && engine.acc_registry().is_some(),
+            "serve -a requires an accession index and registry; build the database with -a"
+        );
+    }
 
     eprintln!(
         "Database loaded in {:.3}s (k={}, l={}), {} worker threads",
@@ -155,19 +172,61 @@ fn serve_connection<R: Read, W: Write>(
     let mut response = Vec::new();
     let mut scratch = Vec::new();
     loop {
-        if !read_request_into(&mut reader, &mut batch)? {
-            return Ok(()); // clean EOF between requests
+        match read_request_kind(&mut reader, &mut batch)? {
+            None => return Ok(()),
+            Some(RequestKind::ClassTable) => {
+                if engine.db().accessions.is_some() && engine.acc_registry().is_some() {
+                    write_class_table(engine, &mut writer)?;
+                } else {
+                    write_error(&mut writer, "Class table requires serve -a")?;
+                }
+                writer.flush()?;
+                continue;
+            }
+            Some(RequestKind::Batch) => {}
         }
 
         progress.start();
         let sequences = batch.ranges.len();
         let bases = batch.ranges.last().map_or(0, |r| r.end as u64);
-        engine.query_batch_wire(&batch.data, &batch.ranges, &mut response, &mut scratch)?;
+        if engine.db().accessions.is_some() {
+            engine.query_classes_wire(&batch.data, &batch.ranges, &mut response);
+        } else {
+            engine.query_batch_wire(&batch.data, &batch.ranges, &mut response, &mut scratch)?;
+        }
 
         writer.write_all(&response)?;
         writer.flush()?;
         progress.completed(sequences, bases);
     }
+}
+
+fn write_class_table<W: Write>(engine: &Engine, writer: &mut W) -> Result<()> {
+    let registry = engine
+        .acc_registry()
+        .as_ref()
+        .context("Missing accession registry")?;
+    let index = engine
+        .db()
+        .accessions
+        .as_ref()
+        .context("Missing accession index")?;
+    writer.write_all(&(registry.len() as u32).to_le_bytes())?;
+    for id in 0..registry.len() {
+        let name = registry.get_name(id as u32).as_bytes();
+        writer.write_all(&(name.len() as u32).to_le_bytes())?;
+        writer.write_all(name)?;
+    }
+    writer.write_all(&(index.num_classes() as u32).to_le_bytes())?;
+    let mut ids = Vec::new();
+    for id in 0..index.num_classes() {
+        index.decode_class_into(id as u32, &mut ids);
+        writer.write_all(&(ids.len() as u32).to_le_bytes())?;
+        for accession in &ids {
+            writer.write_all(&accession.to_le_bytes())?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -176,13 +235,24 @@ struct RequestBatch {
     ranges: Vec<std::ops::Range<usize>>,
 }
 
-/// Reuse the connection's contiguous storage instead of allocating one Vec per read.
-/// Returns false for clean EOF at a frame boundary.
-fn read_request_into<R: Read>(reader: &mut R, batch: &mut RequestBatch) -> Result<bool> {
+#[derive(PartialEq)]
+enum RequestKind {
+    Batch,
+    ClassTable,
+}
+
+/// Reuse contiguous storage; None means clean EOF at a frame boundary.
+fn read_request_kind<R: Read>(
+    reader: &mut R,
+    batch: &mut RequestBatch,
+) -> Result<Option<RequestKind>> {
     let n_seqs = match read_u32_opt(reader)? {
         Some(n) => n,
-        None => return Ok(false),
+        None => return Ok(None),
     };
+    if n_seqs == CLASS_TABLE_TAG {
+        return Ok(Some(RequestKind::ClassTable));
+    }
     if n_seqs > MAX_SEQS_PER_BATCH {
         anyhow::bail!(
             "Batch of {} sequences exceeds the {} limit",
@@ -217,7 +287,12 @@ fn read_request_into<R: Read>(reader: &mut R, batch: &mut RequestBatch) -> Resul
             .with_context(|| format!("Truncated body for sequence {}", i))?;
         batch.ranges.push(start..end);
     }
-    Ok(true)
+    Ok(Some(RequestKind::Batch))
+}
+
+#[cfg(test)]
+fn read_request_into<R: Read>(reader: &mut R, batch: &mut RequestBatch) -> Result<bool> {
+    Ok(read_request_kind(reader, batch)? == Some(RequestKind::Batch))
 }
 
 #[cfg(test)]
@@ -380,7 +455,7 @@ mod tests {
         for threads in [1, 4] {
             let engine = Engine::load(&EngineConfig {
                 db_dir: "data/influenza_test_db".to_string(),
-                accessions: true,
+                accessions: false,
                 background: false,
                 threads,
             })
@@ -422,6 +497,156 @@ mod tests {
         let mut oversized = 1u32.to_le_bytes().to_vec();
         oversized.extend_from_slice(&(MAX_SEQ_LEN + 1).to_le_bytes());
         assert!(read_request_into(&mut oversized.as_slice(), &mut batch).is_err());
+    }
+
+    #[test]
+    fn accession_table_and_sorted_counts_roundtrip_across_batches() {
+        // Use three overlapping classes and unclassed slots; the bundled index has one class.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("target/serve-class-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for entry in std::fs::read_dir("data/influenza_test_db").unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_name().to_string_lossy().starts_with("db.") {
+                std::fs::copy(entry.path(), dir.join(entry.file_name())).unwrap();
+            }
+        }
+        let slots = test_engine().db().num_minimizers;
+        let mut index = crate::database::EqClassAccessions::new_empty(slots);
+        let mut hashes = rustc_hash::FxHashMap::default();
+        let mut build_map = rustc_hash::FxHashMap::default();
+        for slot in 0..slots {
+            let ids: &[u32] = match slot % 4 {
+                0 => &[0],
+                1 => &[1],
+                2 => &[0, 1],
+                _ => &[],
+            };
+            index.add_accessions(slot, ids, &mut hashes, &mut build_map);
+        }
+        index.finalize_for_save(build_map);
+        index
+            .save(dir.join("db.accession").to_str().unwrap())
+            .unwrap();
+        let mut registry = crate::database::AccessionRegistry::new();
+        registry.get_or_create("reference_A.1");
+        registry.get_or_create("reference_β.2");
+        registry
+            .save(dir.join("db.accessions").to_str().unwrap())
+            .unwrap();
+        let fixture = std::fs::read_to_string("data/test_reads/mock.fastq").unwrap();
+        let hit = fixture.lines().nth(1).unwrap().as_bytes().to_vec();
+        let target: Vec<u8> = std::fs::read_to_string("data/influenza_test_db/target.fasta")
+            .unwrap()
+            .lines()
+            .filter(|line| !line.starts_with('>'))
+            .flat_map(|line| line.as_bytes().to_vec())
+            .collect();
+        for threads in [1, 4] {
+            let engine = Engine::load(&EngineConfig {
+                db_dir: dir.to_string_lossy().into_owned(),
+                accessions: true,
+                background: false,
+                threads,
+            })
+            .unwrap();
+            let cases = [
+                Vec::new(),
+                vec![b'A'; engine.k() - 1],
+                vec![b'N'; engine.k() + 10],
+                hit.clone(),
+                hit.repeat(3),
+                target.clone(),
+            ];
+            let sequences: Vec<_> = (0..601)
+                .map(|i| cases[i % cases.len()].as_slice())
+                .collect();
+            let mut request = CLASS_TABLE_TAG.to_le_bytes().to_vec();
+            request.extend(frame(&sequences));
+            request.extend(frame(&[]));
+            request.extend(frame(&[&hit]));
+            let mut output = Vec::new();
+            let progress = ServerProgress::new();
+            serve_connection(&engine, request.as_slice(), &mut output, &progress).unwrap();
+            let mut reader = output.as_slice();
+            let registry = engine.acc_registry().as_ref().unwrap();
+            assert_eq!(read_u32(&mut reader).unwrap() as usize, registry.len());
+            for id in 0..registry.len() {
+                let len = read_u32(&mut reader).unwrap() as usize;
+                assert_eq!(&reader[..len], registry.get_name(id as u32).as_bytes());
+                reader = &reader[len..];
+            }
+            let index = engine.db().accessions.as_ref().unwrap();
+            assert_eq!(read_u32(&mut reader).unwrap() as usize, index.num_classes());
+            for class in 0..index.num_classes() {
+                let n = read_u32(&mut reader).unwrap();
+                let ids: Vec<_> = (0..n).map(|_| read_u32(&mut reader).unwrap()).collect();
+                let mut expected = Vec::new();
+                index.decode_class_into(class as u32, &mut expected);
+                assert_eq!(ids, expected);
+                assert!(ids.iter().all(|id| (*id as usize) < registry.len()));
+            }
+            let mut total_classed = 0;
+            let mut observed = std::collections::BTreeSet::new();
+            for batch in [sequences, vec![], vec![hit.as_slice()]] {
+                assert_eq!(read_u32(&mut reader).unwrap() as usize, batch.len());
+                for seq in batch {
+                    let mut expected = std::collections::BTreeMap::<u32, u32>::new();
+                    let n = seq.len().checked_sub(engine.k()).map_or(0, |n| n + 1);
+                    // Independent one-window lookups verify repeated minimizer expansion too.
+                    for i in 0..n {
+                        let mut minimizers = Vec::new();
+                        engine
+                            .scanner()
+                            .scan_into(&seq[i..i + engine.k()], &mut minimizers);
+                        if minimizers[0] == u64::MAX {
+                            continue;
+                        }
+                        let mut hits = vec![crate::querydb::Lookup::new(minimizers[0])];
+                        engine.db().lookup_batch(&mut hits, &mut Vec::new(), &[]);
+                        let h = hits[0];
+                        if h.is_hit && h.class_id != u32::MAX && h.class_id != 0 {
+                            *expected.entry(h.class_id).or_default() += 1;
+                        }
+                    }
+                    assert_eq!(read_u32(&mut reader).unwrap() as usize, n);
+                    assert_eq!(read_u32(&mut reader).unwrap() as usize, expected.len());
+                    for (id, count) in expected {
+                        observed.insert(id);
+                        assert_eq!(read_u32(&mut reader).unwrap(), id);
+                        assert_eq!(read_u32(&mut reader).unwrap(), count);
+                        total_classed += count;
+                    }
+                }
+            }
+            assert!(total_classed > 0);
+            assert_eq!(observed.len(), 3);
+            assert!(reader.is_empty());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn table_without_accessions_returns_error_and_session_continues() {
+        let engine = test_engine();
+        let mut request = CLASS_TABLE_TAG.to_le_bytes().to_vec();
+        request.extend(frame(&[b"ACGT"]));
+        let mut output = Vec::new();
+        serve_connection(
+            &engine,
+            request.as_slice(),
+            &mut output,
+            &ServerProgress::new(),
+        )
+        .unwrap();
+        let mut reader = output.as_slice();
+        assert_eq!(read_u32(&mut reader).unwrap(), ERROR_TAG);
+        let len = read_u32(&mut reader).unwrap() as usize;
+        assert_eq!(&reader[..len], b"Class table requires serve -a");
+        reader = &reader[len..];
+        assert_eq!(read_u32(&mut reader).unwrap(), 1);
+        assert_eq!(read_u32(&mut reader).unwrap(), 0);
+        assert!(reader.is_empty());
     }
 
     #[test]

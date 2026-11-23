@@ -82,6 +82,10 @@ impl AccIndex {
         self.dense_ids.len()
     }
 
+    pub fn num_classes(&self) -> usize {
+        self.num_classes
+    }
+
     pub fn decode_class_into(&self, class_id: u32, out: &mut Vec<u32>) {
         out.clear();
         let cid = class_id as usize;

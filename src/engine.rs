@@ -261,6 +261,71 @@ impl Engine {
         Ok(())
     }
 
+    /// Encode sorted accession-class counts without decoding accession sets.
+    pub(crate) fn query_classes_wire(
+        &self,
+        data: &[u8],
+        ranges: &[std::ops::Range<usize>],
+        output: &mut Vec<u8>,
+    ) {
+        // Decode no accession sets here. Sort only the class IDs present in each read.
+        let chunks: Vec<Vec<u8>> = self.pool.install(|| {
+            ranges
+                .par_chunks(QUERY_CHUNK_SIZE)
+                .map_init(
+                    || (BatchScratch::default(), Vec::<u32>::new()),
+                    |(scratch, classes), ranges| {
+                        let mut encoded = Vec::new();
+                        for range in ranges {
+                            scratch.hits.clear();
+                            self.db.query_into(
+                                &self.scanner,
+                                &data[range.clone()],
+                                &mut scratch.minimizers,
+                                &mut scratch.hits,
+                                &mut scratch.probes,
+                                &self.bg_filters,
+                            );
+                            classes.clear();
+                            classes.extend(
+                                scratch
+                                    .hits
+                                    .iter()
+                                    .filter(|h| {
+                                        h.is_hit && h.class_id != u32::MAX && h.class_id != 0
+                                    })
+                                    .map(|h| h.class_id),
+                            );
+                            classes.sort_unstable();
+                            encoded.extend_from_slice(&(scratch.hits.len() as u32).to_le_bytes());
+                            let count_pos = encoded.len();
+                            encoded.extend_from_slice(&0u32.to_le_bytes());
+                            let mut count = 0u32;
+                            let mut i = 0;
+                            while i < classes.len() {
+                                let id = classes[i];
+                                let start = i;
+                                while i < classes.len() && classes[i] == id {
+                                    i += 1;
+                                }
+                                encoded.extend_from_slice(&id.to_le_bytes());
+                                encoded.extend_from_slice(&((i - start) as u32).to_le_bytes());
+                                count += 1;
+                            }
+                            encoded[count_pos..count_pos + 4].copy_from_slice(&count.to_le_bytes());
+                        }
+                        encoded
+                    },
+                )
+                .collect()
+        });
+        output.clear();
+        output.extend_from_slice(&(ranges.len() as u32).to_le_bytes());
+        for chunk in chunks {
+            output.extend_from_slice(&chunk);
+        }
+    }
+
     /// Per-k-mer taxids for a single sequence. Runs on the calling thread.
     pub fn query_one(&self, seq: &[u8]) -> Vec<u32> {
         let mut minimizer_buf = Vec::new();
